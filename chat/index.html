@@ -68,13 +68,16 @@
             box-shadow: none;
         }
 
-        /* Chat bubbles container */
+        /* Chat bubbles container - positioned in the CENTER between characters */
         #chatBubbles {
             position: absolute;
             top: 100px;
-            left: 0;
-            right: 0;
-            bottom: 240px;
+            /* Center area: narrower zone between characters for more compact bubbles
+               Characters are at 25% (left) and 75% (right)
+               Bubbles occupy a tighter middle area (30% to 70%) */
+            left: 32%;
+            right: 32%;
+            bottom: 20px;
             overflow-y: auto;
             padding: 20px;
             z-index: 50;
@@ -83,8 +86,8 @@
 
         /* Individual chat bubble */
         .chat-bubble {
-            max-width: 60%;
-            margin: 15px 0;
+            max-width: 85%;
+            margin: 15px auto;
             padding: 15px 20px;
             border-radius: 20px;
             color: white;
@@ -108,19 +111,21 @@
             }
         }
 
-        /* Obama's bubbles - left side, blue */
+        /* Obama's bubbles - positioned on left within center area, blue */
         .chat-bubble.obama {
             background: linear-gradient(135deg, #4A90E2 0%, #357ABD 100%);
+            /* Align to the left side of the center container (closer to Obama) */
             margin-right: auto;
-            margin-left: 5%;
+            margin-left: 0;
             border-bottom-left-radius: 5px;
         }
 
-        /* Trump's bubbles - right side, red */
+        /* Trump's bubbles - positioned on right within center area, red */
         .chat-bubble.trump {
             background: linear-gradient(135deg, #E24A4A 0%, #C93A3A 100%);
+            /* Align to the right side of the center container (closer to Trump) */
             margin-left: auto;
-            margin-right: 5%;
+            margin-right: 0;
             border-bottom-right-radius: 5px;
         }
 
@@ -141,46 +146,6 @@
             line-height: 1.6;
         }
 
-        /* Transcript display (compact version at bottom) */
-        #transcript {
-            position: absolute;
-            bottom: 20px;
-            left: 20px;
-            right: 20px;
-            max-height: 200px;
-            background: rgba(0, 0, 0, 0.85);
-            color: white;
-            padding: 15px;
-            border-radius: 10px;
-            overflow-y: auto;
-            z-index: 100;
-            backdrop-filter: blur(10px);
-            font-size: 13px;
-        }
-
-        .transcript-entry {
-            margin: 5px 0;
-            padding: 5px;
-            border-radius: 3px;
-            font-size: 12px;
-        }
-
-        .transcript-entry.obama {
-            border-left: 4px solid #4A90E2;
-            background: rgba(74, 144, 226, 0.15);
-        }
-
-        .transcript-entry.trump {
-            border-left: 4px solid #E24A4A;
-            background: rgba(226, 74, 74, 0.15);
-        }
-
-        .transcript-entry strong {
-            display: inline-block;
-            min-width: 70px;
-            font-weight: bold;
-            font-size: 11px;
-        }
 
         /* Custom scrollbar for chat bubbles */
         #chatBubbles::-webkit-scrollbar {
@@ -198,25 +163,6 @@
         }
 
         #chatBubbles::-webkit-scrollbar-thumb:hover {
-            background: rgba(255, 255, 255, 0.5);
-        }
-
-        /* Custom scrollbar for transcript */
-        #transcript::-webkit-scrollbar {
-            width: 8px;
-        }
-
-        #transcript::-webkit-scrollbar-track {
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
-        }
-
-        #transcript::-webkit-scrollbar-thumb {
-            background: rgba(255, 255, 255, 0.3);
-            border-radius: 10px;
-        }
-
-        #transcript::-webkit-scrollbar-thumb:hover {
             background: rgba(255, 255, 255, 0.5);
         }
     </style>
@@ -237,9 +183,6 @@
     <!-- Chat Bubbles (main visual display) -->
     <div id="chatBubbles"></div>
 
-    <!-- Transcript (compact log at bottom) -->
-    <div id="transcript"></div>
-
     <!-- PIXI canvas will be inserted here -->
 
     <!-- Load libraries in correct order: PIXI -> Cubism Core -> PIXI Live2D plugin -->
@@ -247,6 +190,7 @@
     <!-- Use cubism-web package which includes the core runtime -->
     <script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display/dist/cubism4.min.js"></script>
-    <script src="main.js"></script>
+    <!-- Add timestamp to prevent caching during development -->
+    <script src="main.js?v=2"></script>
 </body>
 </html>

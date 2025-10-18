@@ -16,16 +16,39 @@ window.addEventListener('load', async function() {
         resizeTo: window,
         backgroundColor: 0x333333
     });
+    // Ensure the canvas sits BEHIND overlays (chat bubbles, controls, transcript)
+    // Without explicit positioning/z-index, some browsers may paint the canvas above
+    // absolutely positioned overlays depending on DOM order.
+    app.view.style.position = 'fixed';
+    app.view.style.top = '0';
+    app.view.style.left = '0';
+    app.view.style.width = '100%';
+    app.view.style.height = '100%';
+    app.view.style.zIndex = '0';
+
     document.body.appendChild(app.view);
+
+    // ========================================
+    // BACKGROUND IMAGE SPRITE
+    // ========================================
+    // This sprite will be dynamically loaded when the server sends a generated
+    // background image based on the debate topic. If no image is received,
+    // the default gray background (backgroundColor: 0x333333) remains visible.
+    //
+    // z-index management:
+    // - Background sprite: addChildAt(sprite, 0) ensures it's behind everything
+    // - Character sprites: addChild() adds them on top
+    // - HTML overlays: z-index in CSS ensures they're above canvas
+    let backgroundSprite = null;
 
     // ========================================
     // LOAD OBAMA SPRITE CHARACTER (LEFT SIDE)
     // ========================================
     // Define the Obama image paths for gesture cycling
     const obamaImagePaths = [
-        'obama.png',
-        'obama_gesture1.png',
-        'obama_gesture2.png',
+        'assets/obama.png',
+        'assets/obama_gesture1.png',
+        'assets/obama_gesture2.png',
     ];
 
     let currentObamaIndex = 0;
@@ -92,9 +115,11 @@ window.addEventListener('load', async function() {
     // ========================================
     // Define the Trump image paths for gesture cycling
     const trumpImagePaths = [
-        'trump.png',
-        'trump_gesture1.png',
-        'trump_gesture2.png',
+        'assets/trump1.png',
+        'assets/trumpTalk.png',
+        'assets/trump2.png',
+        'assets/trumpTalk2.png',
+        'assets/trump3.png',
     ];
 
     let currentTrumpIndex = 0;
@@ -274,7 +299,7 @@ window.addEventListener('load', async function() {
     // ========================================
     // WINDOW RESIZE HANDLING
     // ========================================
-    // Reposition both characters when window is resized
+    // Reposition both characters and background when window is resized
     window.addEventListener('resize', () => {
         // Recalculate Obama's position (left side)
         const newObamaTargetHeight = window.innerHeight * 0.6;
@@ -295,6 +320,21 @@ window.addEventListener('load', async function() {
             sprite.x = window.innerWidth * 0.75;
             sprite.y = window.innerHeight / 2;
         });
+
+        // Recalculate background sprite scale and position if it exists
+        // This ensures the background always covers the full screen after resize
+        if (backgroundSprite) {
+            // Calculate new scale to cover screen (same logic as initial load)
+            const scaleX = app.screen.width / backgroundSprite.texture.width;
+            const scaleY = app.screen.height / backgroundSprite.texture.height;
+            const scale = Math.max(scaleX, scaleY); // Cover mode
+
+            backgroundSprite.scale.set(scale);
+
+            // Re-center on the new screen dimensions
+            backgroundSprite.x = app.screen.width / 2;
+            backgroundSprite.y = app.screen.height / 2;
+        }
     });
 
     // ========================================
@@ -303,57 +343,90 @@ window.addEventListener('load', async function() {
     /**
      * DebateClient manages the WebSocket connection to the Python backend debate server.
      * It handles:
-     * - Real-time audio streaming from both AI debaters (Obama and Trump)
-     * - Audio playback using the Web Audio API
+     * - Real-time MP3 audio streaming from both AI debaters (Obama and Trump)
+     * - Audio playback using HTML5 Audio elements
      * - Text transcript display
      * - Visual feedback when each speaker is talking
      *
-     * The class uses a queue-based playback system to ensure smooth, gapless audio
-     * even with network latency. Audio from Gemini arrives as 16-bit PCM at 24kHz,
-     * which we convert to AudioBuffers for browser playback.
+     * The server streams MP3 audio as binary WebSocket frames.
+     * We assemble these chunks into Blob objects and play them using HTML5 <audio> elements.
      */
     class DebateClient {
-        constructor() {
+        constructor(pixiApp) {
+            // Store reference to PIXI app for background image manipulation
+            this.app = pixiApp;
+
             // WebSocket connection to Python backend
             this.ws = null;
 
-            // Web Audio API context for playback
-            // Must be initialized after user interaction (browser security requirement)
-            this.audioContext = null;
-
-            // Separate audio queues for each speaker to prevent cross-talk
-            // Queue-based playback ensures smooth transitions between audio chunks
-            this.audioQueues = {
+            // Track current audio buffers being assembled from binary chunks
+            this.audioBuffers = {
                 'Obama': [],
                 'Trump': []
             };
 
-            // Track playback state to prevent overlapping playback of same speaker
-            this.isPlaying = {
-                'Obama': false,
-                'Trump': false
+            // Track which speaker is currently receiving audio chunks
+            this.currentlyReceivingAudio = null;
+
+            // HTML5 Audio elements for playback (one per speaker)
+            this.audioPlayers = {
+                'Obama': new Audio(),
+                'Trump': new Audio()
             };
+
+            // Setup audio player event handlers
+            this.setupAudioPlayers();
         }
 
         /**
-         * Establishes WebSocket connection to the debate server and initializes audio
+         * Configure audio players with event handlers for playback lifecycle
+         */
+        setupAudioPlayers() {
+            ['Obama', 'Trump'].forEach(speaker => {
+                const player = this.audioPlayers[speaker];
+
+                // When audio finishes playing, send playback_complete to server
+                player.onended = () => {
+                    console.log(`✅ ${speaker}'s audio playback completed`);
+                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                        this.ws.send(JSON.stringify({
+                            type: 'playback_complete',
+                            speaker: speaker
+                        }));
+                    }
+                    // Update visual state
+                    this.updateSpeakerVisuals(speaker, false);
+                };
+
+                // Handle playback errors
+                player.onerror = (e) => {
+                    console.error(`❌ Audio playback error for ${speaker}:`, e);
+                };
+
+                // Log and update visuals when playback starts
+                player.onplay = () => {
+                    console.log(`🔊 Started playing ${speaker}'s audio`);
+                    this.updateSpeakerVisuals(speaker, true);
+                };
+            });
+        }
+
+        /**
+         * Establishes WebSocket connection to the debate server
          * Must be called from a user interaction (button click) due to browser autoplay policies
          *
          * @param {string} topic - The debate topic to send to the server
          */
         async connect(topic) {
-            // Initialize Web Audio API
-            // AudioContext must be created after user gesture (browser security requirement)
-            this.audioContext = new AudioContext();
-
             // Connect to Python WebSocket server on localhost:8765
+            // Set binaryType to 'arraybuffer' to receive binary audio chunks
             this.ws = new WebSocket('ws://localhost:8765');
+            this.ws.binaryType = 'arraybuffer';
 
             this.ws.onopen = () => {
                 console.log('✅ Connected to debate server');
 
                 // Send the debate topic to the server to initialize the debate
-                // Server will use this to create system instructions for both AIs
                 this.ws.send(JSON.stringify({
                     type: 'start_debate',
                     topic: topic
@@ -361,9 +434,15 @@ window.addEventListener('load', async function() {
             };
 
             this.ws.onmessage = (event) => {
-                // All messages from server are JSON-encoded
-                const msg = JSON.parse(event.data);
-                this.handleMessage(msg);
+                // Check if this is binary data (audio chunk) or text (JSON message)
+                if (event.data instanceof ArrayBuffer) {
+                    // Binary audio chunk - add to current speaker's buffer
+                    this.handleBinaryAudio(event.data);
+                } else {
+                    // Text JSON message
+                    const msg = JSON.parse(event.data);
+                    this.handleMessage(msg);
+                }
             };
 
             this.ws.onerror = (error) => {
@@ -379,9 +458,10 @@ window.addEventListener('load', async function() {
          * Routes incoming messages to appropriate handlers based on message type
          * Message types:
          * - 'init': Debate initialization with topic
-         * - 'audio': PCM audio data from a speaker
+         * - 'audio_start': Speaker's audio is about to stream
+         * - 'audio_complete': Speaker's audio streaming finished
          * - 'text': Transcript text from a speaker
-         * - 'speaking': Speaking state change (for visual feedback)
+         * - 'background_image': Generated background image from server
          */
         handleMessage(msg) {
             switch(msg.type) {
@@ -389,135 +469,90 @@ window.addEventListener('load', async function() {
                     console.log('🎤 Debate topic:', msg.topic);
                     break;
 
-                case 'audio':
-                    // Queue audio for playback
-                    this.handleAudio(msg.speaker, msg.data);
+                case 'background_image':
+                    // Handle dynamically generated background image from server
+                    this.loadBackgroundImage(msg.data, msg.format);
+                    break;
+
+                case 'audio_start':
+                    // Start buffering audio for this speaker
+                    console.log(`🎵 Starting audio reception for ${msg.speaker}`);
+                    this.currentlyReceivingAudio = msg.speaker;
+                    this.audioBuffers[msg.speaker] = []; // Clear previous buffer
+                    break;
+
+                case 'audio_complete':
+                    // All audio chunks received - assemble and play
+                    console.log(`🎵 Audio reception complete for ${msg.speaker}`);
+                    this.playBufferedAudio(msg.speaker);
+                    this.currentlyReceivingAudio = null;
                     break;
 
                 case 'text':
                     // Display transcript in UI
                     this.handleTranscript(msg.speaker, msg.text);
                     break;
-
-                case 'speaking':
-                    // Update sprite visuals based on speaking state
-                    this.handleSpeakingState(msg.speaker, msg.is_speaking);
-                    break;
             }
         }
 
         /**
-         * Processes incoming audio data and queues it for playback
-         * Audio arrives as hex-encoded PCM bytes which we convert to Uint8Array
+         * Handle incoming binary audio chunk from WebSocket
          *
-         * @param {string} speaker - "Obama" or "Trump"
-         * @param {string} hexData - Hex-encoded audio data (e.g., "0a1b2c3d...")
+         * @param {ArrayBuffer} arrayBuffer - Binary MP3 audio data
          */
-        handleAudio(speaker, hexData) {
-            // Convert hex string to Uint8Array
-            // Each pair of hex characters represents one byte (e.g., "0a" = 10)
-            const bytes = new Uint8Array(
-                hexData.match(/.{1,2}/g).map(byte => parseInt(byte, 16))
-            );
-
-            // Add audio chunk to speaker's queue
-            this.audioQueues[speaker].push(bytes);
-
-            // Start playback if not already playing
-            // This ensures continuous playback without gaps
-            if (!this.isPlaying[speaker]) {
-                this.playAudioQueue(speaker);
+        handleBinaryAudio(arrayBuffer) {
+            if (!this.currentlyReceivingAudio) {
+                console.warn('Received audio chunk but no speaker is active');
+                return;
             }
+
+            // Add binary chunk to the current speaker's buffer
+            this.audioBuffers[this.currentlyReceivingAudio].push(arrayBuffer);
+            console.log(
+                `Added ${arrayBuffer.byteLength} bytes to ${this.currentlyReceivingAudio}'s buffer`
+            );
         }
 
         /**
-         * Continuously plays queued audio chunks for a given speaker
-         * Uses async/await to ensure sequential playback without gaps
+         * Assemble buffered audio chunks into a Blob and play it
          *
          * @param {string} speaker - "Obama" or "Trump"
          */
-        async playAudioQueue(speaker) {
-            this.isPlaying[speaker] = true;
-
-            // Process queue until empty
-            while (this.audioQueues[speaker].length > 0) {
-                const audioData = this.audioQueues[speaker].shift();
-
-                // Convert raw PCM data to Web Audio API format
-                const audioBuffer = this.pcmToAudioBuffer(audioData);
-
-                // Play the audio chunk and wait for it to finish
-                // The 'await' ensures gapless sequential playback
-                await this.playAudioBuffer(audioBuffer);
+        playBufferedAudio(speaker) {
+            const chunks = this.audioBuffers[speaker];
+            if (!chunks || chunks.length === 0) {
+                console.warn(`No audio chunks buffered for ${speaker}`);
+                return;
             }
 
-            this.isPlaying[speaker] = false;
-        }
+            // Create a Blob from all audio chunks
+            // Browser natively handles MP3 decoding
+            const audioBlob = new Blob(chunks, { type: 'audio/mpeg' });
+            const audioUrl = URL.createObjectURL(audioBlob);
 
-        /**
-         * Converts 16-bit PCM audio data to an AudioBuffer for Web Audio API playback
-         *
-         * Gemini Live API outputs:
-         * - 16-bit signed integer PCM (Int16)
-         * - 24kHz sample rate
-         * - Mono (1 channel)
-         *
-         * Web Audio API requires:
-         * - 32-bit float samples (Float32)
-         * - Range: -1.0 to +1.0
-         *
-         * @param {Uint8Array} pcmData - Raw PCM bytes from Gemini
-         * @returns {AudioBuffer} - AudioBuffer ready for playback
-         */
-        pcmToAudioBuffer(pcmData) {
-            // Gemini sends 16-bit PCM at 24kHz mono
-            const sampleRate = 24000;
-            const numChannels = 1;
-
-            // Convert Uint8Array to Int16Array (16-bit samples)
-            // This reinterprets the byte buffer as signed 16-bit integers
-            const int16Data = new Int16Array(pcmData.buffer);
-
-            // Create AudioBuffer with appropriate dimensions
-            const audioBuffer = this.audioContext.createBuffer(
-                numChannels,
-                int16Data.length,
-                sampleRate
+            console.log(
+                `🎧 Playing ${speaker}'s audio (${audioBlob.size} bytes, ${chunks.length} chunks)`
             );
 
-            // Convert Int16 samples to Float32 (Web Audio API format)
-            const channelData = audioBuffer.getChannelData(0);
-            for (let i = 0; i < int16Data.length; i++) {
-                // Normalize 16-bit PCM (-32768 to +32767) to Float32 (-1.0 to +1.0)
-                // Divide by 32768 (2^15) to map the range
-                channelData[i] = int16Data[i] / 32768.0;
-            }
-
-            return audioBuffer;
-        }
-
-        /**
-         * Plays an AudioBuffer through the speakers
-         * Returns a Promise that resolves when playback completes
-         *
-         * @param {AudioBuffer} audioBuffer - The audio to play
-         * @returns {Promise} - Resolves when audio finishes playing
-         */
-        playAudioBuffer(audioBuffer) {
-            return new Promise((resolve) => {
-                // Create a buffer source node (one-time use)
-                const source = this.audioContext.createBufferSource();
-                source.buffer = audioBuffer;
-
-                // Connect to speakers
-                source.connect(this.audioContext.destination);
-
-                // Resolve promise when playback ends
-                source.onended = resolve;
-
-                // Start playback immediately
-                source.start();
+            // Set the audio source and play
+            const player = this.audioPlayers[speaker];
+            player.src = audioUrl;
+            player.play().catch(error => {
+                console.error(`Failed to play audio for ${speaker}:`, error);
             });
+
+            // Clean up object URL after playback to free memory
+            player.onended = () => {
+                URL.revokeObjectURL(audioUrl);
+                console.log(`✅ ${speaker}'s audio playback completed`);
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify({
+                        type: 'playback_complete',
+                        speaker: speaker
+                    }));
+                }
+                this.updateSpeakerVisuals(speaker, false);
+            };
         }
 
         /**
@@ -532,22 +567,8 @@ window.addEventListener('load', async function() {
         }
 
         /**
-         * Updates visual feedback when a speaker starts/stops talking
-         *
-         * @param {string} speaker - "Obama" or "Trump"
-         * @param {boolean} isSpeaking - Whether the speaker is currently talking
-         */
-        handleSpeakingState(speaker, isSpeaking) {
-            this.updateSpeakerVisuals(speaker, isSpeaking);
-        }
-
-        /**
          * Adds a transcript entry to the UI display
-         * Creates both a chat bubble and a compact transcript entry
-         *
-         * Design decisions:
-         * - Chat bubbles: Large, prominent, positioned like a conversation
-         * - Transcript: Compact log at bottom for full history reference
+         * Creates a chat bubble for visual display
          *
          * @param {string} speaker - "Obama" or "Trump"
          * @param {string} text - Transcript text
@@ -555,17 +576,127 @@ window.addEventListener('load', async function() {
         updateTranscriptUI(speaker, text) {
             // Create chat bubble (main visual element)
             this.createChatBubble(speaker, text);
+        }
 
-            // Also add to compact transcript log at bottom
-            const transcriptDiv = document.getElementById('transcript');
-            if (transcriptDiv) {
-                const entry = document.createElement('div');
-                entry.className = `transcript-entry ${speaker.toLowerCase()}`;
-                entry.innerHTML = `<strong>${speaker}:</strong> ${text}`;
-                transcriptDiv.appendChild(entry);
+        /**
+         * Load and display a dynamically generated background image
+         *
+         * This method receives a base64-encoded image from the server (generated by Gemini),
+         * decodes it, and loads it as a PIXI.Sprite background layer behind all characters.
+         *
+         * Architecture:
+         * - Image arrives asynchronously after debate starts (non-blocking)
+         * - Replaces any existing background sprite
+         * - Scales to cover full screen while maintaining aspect ratio
+         * - Positioned at z-index 0 (behind character sprites)
+         *
+         * Trade-offs:
+         * - Cover scaling may crop image edges (better than letterboxing for fullscreen background)
+         * - Base64 decoding is synchronous but fast enough for typical image sizes
+         * - No loading spinner (image appears when ready, gray background until then)
+         *
+         * @param {string} base64Data - Base64-encoded image data from server
+         * @param {string} format - Image format (png, jpeg, etc.)
+         */
+        async loadBackgroundImage(base64Data, format) {
+            console.log(`🎨 Loading background image (${base64Data.length} chars base64, format: ${format})`);
 
-                // Auto-scroll to bottom to show latest message
-                transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+            try {
+                // Remove existing background sprite if present
+                // This handles the case where a new debate starts while an old image is displayed
+                if (backgroundSprite) {
+                    console.log('🗑️  Removing old background sprite');
+                    this.app.stage.removeChild(backgroundSprite);
+                    backgroundSprite.destroy(true); // true = destroy texture too
+                    backgroundSprite = null;
+                }
+
+                // Decode base64 to binary ArrayBuffer
+                // atob() converts base64 string to binary string, then we convert to Uint8Array
+                const binaryString = atob(base64Data);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+
+                // Create Blob from binary data
+                // Blob is required to create an object URL that PIXI can load
+                const blob = new Blob([bytes], { type: `image/${format}` });
+                const imageUrl = URL.createObjectURL(blob);
+
+                console.log(`📥 Loading image texture from blob URL: ${imageUrl}`);
+                console.log(`📊 Blob size: ${blob.size} bytes, type: ${blob.type}`);
+
+                // Load image using native Image element first, then convert to PIXI texture
+                // This is more reliable than PIXI.Assets.load for blob URLs
+                const img = new Image();
+                const imageLoadPromise = new Promise((resolve, reject) => {
+                    img.onload = () => {
+                        console.log('🎉 Image onload event fired!');
+                        resolve(img);
+                    };
+                    img.onerror = (e) => {
+                        console.error('❌ Image onerror event fired:', e);
+                        reject(new Error(`Failed to load image: ${e}`));
+                    };
+                });
+                img.src = imageUrl;
+                console.log(`📤 Image src set, waiting for load...`);
+
+                // Wait for image to load
+                await imageLoadPromise;
+                console.log(`✅ Image loaded successfully: ${img.width}x${img.height}`);
+
+                // Create PIXI texture from loaded image
+                const texture = PIXI.Texture.from(img);
+                console.log(`✅ PIXI Texture created: ${texture.width}x${texture.height}`);
+
+                // Create sprite from texture
+                const sprite = new PIXI.Sprite(texture);
+
+                // Ensure sprite is fully opaque and visible
+                sprite.alpha = 1.0;
+                sprite.visible = true;
+
+                // Calculate scale to cover full screen (similar to CSS background-size: cover)
+                // This ensures no empty space, though it may crop edges
+                const scaleX = this.app.screen.width / texture.width;
+                const scaleY = this.app.screen.height / texture.height;
+                const scale = Math.max(scaleX, scaleY); // max = cover (min = contain)
+
+                console.log(`📊 Screen size: ${this.app.screen.width}x${this.app.screen.height}`);
+                console.log(`📊 Texture size: ${texture.width}x${texture.height}`);
+                console.log(`📊 Calculated scale: ${scale} (scaleX=${scaleX}, scaleY=${scaleY})`);
+
+                sprite.scale.set(scale);
+
+                // Center the sprite on screen
+                sprite.anchor.set(0.5, 0.5);
+                sprite.x = this.app.screen.width / 2;
+                sprite.y = this.app.screen.height / 2;
+
+                // Add at index 0 to place behind all existing sprites (characters)
+                // This is crucial - characters were added with addChild() so they're already on top
+                console.log(`📊 Stage children before adding background: ${this.app.stage.children.length}`);
+                this.app.stage.addChildAt(sprite, 0);
+                console.log(`📊 Stage children after adding background: ${this.app.stage.children.length}`);
+                console.log(`📊 Background sprite added at index 0`);
+                console.log(`📊 Sprite properties: x=${sprite.x}, y=${sprite.y}, scale=${sprite.scale.x}, visible=${sprite.visible}, alpha=${sprite.alpha}`);
+
+                // Store reference for cleanup and resizing
+                backgroundSprite = sprite;
+
+                // Clean up object URL to free memory
+                // Can be called immediately after texture loads
+                URL.revokeObjectURL(imageUrl);
+
+                console.log('✅ Background image loaded and displayed');
+                console.log(`📊 Final stage children:`, this.app.stage.children);
+
+            } catch (error) {
+                // Graceful failure - log error but don't disrupt debate
+                console.error('❌ Failed to load background image:', error);
+                // Gray background remains visible if this fails
             }
         }
 
@@ -642,7 +773,8 @@ window.addEventListener('load', async function() {
 
     // Initialize debate client instance
     // Will be connected when user clicks "Start Debate" button
-    window.debateClient = new DebateClient();
+    // Pass app reference so DebateClient can manipulate background sprite
+    window.debateClient = new DebateClient(app);
 
     // ========================================
     // DEBATE CONTROLS
@@ -677,26 +809,56 @@ window.addEventListener('load', async function() {
      * Stop button event handler
      * Cleanly closes the WebSocket connection to the debate server
      * and clears the UI for the next debate
+     *
+     * This performs a complete cleanup so that a new debate can start fresh:
+     * - Closes WebSocket connection
+     * - Stops all audio playback
+     * - Clears audio buffers
+     * - Clears all UI elements (chat bubbles)
+     * - Removes background sprite and frees memory
+     * - Re-enables the topic input for the next debate
      */
     document.getElementById('stopBtn').addEventListener('click', () => {
+        // Close WebSocket connection
         if (window.debateClient.ws) {
             window.debateClient.ws.close();
+            window.debateClient.ws = null;
         }
 
-        // Clear chat bubbles and transcript for fresh start
+        // Stop all audio playback
+        ['Obama', 'Trump'].forEach(speaker => {
+            const player = window.debateClient.audioPlayers[speaker];
+            player.pause();
+            player.src = '';  // Clear audio source
+        });
+
+        // Clear audio buffers
+        window.debateClient.audioBuffers = {
+            'Obama': [],
+            'Trump': []
+        };
+        window.debateClient.currentlyReceivingAudio = null;
+
+        // Clear chat bubbles for fresh start
         const chatBubblesDiv = document.getElementById('chatBubbles');
         if (chatBubblesDiv) {
             chatBubblesDiv.innerHTML = '';
         }
 
-        const transcriptDiv = document.getElementById('transcript');
-        if (transcriptDiv) {
-            transcriptDiv.innerHTML = '';
+        // Clean up background sprite to prevent memory leaks
+        // This ensures the next debate starts with a clean slate
+        if (backgroundSprite) {
+            console.log('🗑️  Cleaning up background sprite');
+            app.stage.removeChild(backgroundSprite);
+            backgroundSprite.destroy(true); // true = destroy texture and free GPU memory
+            backgroundSprite = null;
         }
 
-        // Update UI state
+        // Update UI state - re-enable all controls for next debate
         document.getElementById('startBtn').disabled = false;
         document.getElementById('stopBtn').disabled = true;
-        document.getElementById('topicInput').disabled = false;  // Re-enable for next debate
+        document.getElementById('topicInput').disabled = false;
+
+        console.log('✅ Debate stopped and all state cleared');
     });
 });
