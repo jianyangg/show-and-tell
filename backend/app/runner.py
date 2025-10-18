@@ -114,6 +114,9 @@ class TeachSession:
     frames: List[Dict[str, Any]] = field(default_factory=list)
     _last_frame_ts: float = 0.0
     _pressed_keys: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Mouse state tracking for drag detection (similar to keyboard tracking pattern)
+    # Stores button -> {"ts": timestamp, "x": start_x, "y": start_y, "moved": bool, "extra": metadata}
+    _mouse_down_state: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     async def capture_frame(self, *, force: bool = False) -> str:
         png = await self.page.screenshot(type="png")
@@ -195,6 +198,109 @@ class TeachSession:
                     data=hold_payload,
                 )
             )
+
+    def record_mouse_down(
+        self,
+        x: float,
+        y: float,
+        button: str = "left",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Record a mouse button press at coordinates (x, y).
+        Tracks the down state to detect drags when mouse_move occurs.
+
+        This follows the same robust pattern as keyboard tracking:
+        - Store initial coordinates and metadata
+        - Will be used to detect drag vs. click based on movement threshold
+        """
+        now = time.time() - self.created_at
+        self._mouse_down_state[button] = {
+            "ts": now,
+            "x": x,
+            "y": y,
+            "moved": False,
+            "extra": extra or {},
+        }
+
+    def record_mouse_move(
+        self, x: float, y: float, threshold: float = 5.0
+    ) -> None:
+        """
+        Record mouse movement. If mouse is down, mark as potentially dragging.
+
+        Args:
+            x, y: Current mouse coordinates
+            threshold: Minimum pixel distance to consider movement as a drag (default 5.0)
+        """
+        # Check if any buttons are currently pressed
+        for button, state in self._mouse_down_state.items():
+            start_x = state["x"]
+            start_y = state["y"]
+            # Calculate distance moved from initial mouse_down position
+            distance = ((x - start_x) ** 2 + (y - start_y) ** 2) ** 0.5
+            if distance >= threshold:
+                state["moved"] = True
+
+    def record_mouse_up(
+        self,
+        x: float,
+        y: float,
+        button: str = "left",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Record mouse button release. Determines if this was a click or drag based on movement.
+
+        Following the keyboard event pattern:
+        - If mouse moved significantly during down→up, log as "drag" event
+        - Otherwise, log as "click" event
+        - Always clean up the tracked state (similar to popping pressed keys)
+        """
+        now = time.time() - self.created_at
+        down_state = self._mouse_down_state.pop(button, None)
+
+        if not down_state:
+            # Mouse up without corresponding down (edge case) - just ignore
+            return
+
+        start_x = down_state["x"]
+        start_y = down_state["y"]
+        moved = down_state["moved"]
+        duration = now - down_state["ts"]
+
+        if moved:
+            # This was a drag operation - log with start and end coordinates
+            drag_payload = {
+                "start_x": start_x,
+                "start_y": start_y,
+                "end_x": x,
+                "end_y": y,
+                "button": button,
+                "duration": duration,
+            }
+            # Merge metadata from mouse_down and mouse_up
+            down_extra = down_state.get("extra") or {}
+            up_extra = extra or {}
+            drag_payload.update(down_extra)
+            # Prefer mouse_up metadata for the target element (where drag ended)
+            if up_extra:
+                drag_payload["end_element"] = up_extra.get("element")
+                drag_payload["end_actionable"] = up_extra.get("actionable")
+                drag_payload["end_selector"] = up_extra.get("selector")
+                drag_payload["end_primaryLocator"] = up_extra.get("primaryLocator")
+            self.events.append(TeachEvent(ts=now, kind="drag", data=drag_payload))
+        else:
+            # This was a simple click (down + up without significant movement)
+            click_payload = {
+                "x": start_x,
+                "y": start_y,
+                "button": button,
+                "duration": duration,
+            }
+            down_extra = down_state.get("extra") or {}
+            click_payload.update(down_extra)
+            self.events.append(TeachEvent(ts=now, kind="click", data=click_payload))
 
 
 class TeachManager:

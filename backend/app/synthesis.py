@@ -298,6 +298,10 @@ class PlanSynthesizer:
         if not self._enabled:
             raise RuntimeError("Plan synthesizer is disabled")
 
+        # Attempt to transcribe audio if present (before building prompt)
+        # This populates recording.transcript which is then included in the prompt
+        await self._transcribe_audio_if_present(recording)
+
         provider = self._resolve_provider(request.provider)
         prompt = self._build_prompt(
             recording, request.plan_name, request.start_url, request.variable_hints
@@ -348,6 +352,66 @@ class PlanSynthesizer:
             if not self._openai_client:
                 raise RuntimeError("ChatGPT plan synthesizer is disabled")
         return provider
+
+    async def _transcribe_audio_if_present(self, recording: RecordingBundle) -> None:
+        """
+        Transcribe audio if available and populate recording.transcript.
+
+        This method is called before building the synthesis prompt to ensure
+        the transcript is available for inclusion. Failures are logged but
+        don't stop synthesis (graceful degradation).
+
+        Args:
+            recording: RecordingBundle that may contain audio_wav_base64.
+                      Its transcript field will be populated if transcription succeeds.
+        """
+        # Skip if no audio or transcript already exists
+        if not recording.audio_wav_base64:
+            logger.debug("No audio data in recording, skipping transcription")
+            return
+
+        if recording.transcript and recording.transcript.strip():
+            logger.debug("Transcript already exists, skipping transcription")
+            return
+
+        try:
+            # Import transcription service (lazy import to avoid hard dependency)
+            from .transcription import get_transcription_service
+
+            service = get_transcription_service()
+
+            if not service.enabled:
+                logger.debug("Transcription service disabled, skipping")
+                return
+
+            logger.info("Starting audio transcription...")
+            result = await service.transcribe(recording.audio_wav_base64)
+
+            if result:
+                # Format transcript for prompt inclusion
+                formatted = service.format_for_prompt(result)
+                if formatted:
+                    recording.transcript = formatted
+                    logger.info(
+                        "Transcription completed: %d words in %d chunks",
+                        len(result.words),
+                        len(result.chunks)
+                    )
+                    # Log the actual transcript for debugging
+                    logger.info("Transcript preview:\n%s", formatted[:500] + ("..." if len(formatted) > 500 else ""))
+                else:
+                    logger.warning("Transcription returned empty result")
+            else:
+                logger.warning("Transcription failed, continuing without transcript")
+
+        except Exception as exc:
+            # Graceful degradation: log error but don't raise
+            # Plan synthesis should work even without transcript
+            logger.error(
+                "Audio transcription failed: %s. Continuing without transcript.",
+                exc,
+                exc_info=True
+            )
 
     async def _synthesize_with_gemini(
         self,
@@ -493,6 +557,35 @@ class PlanSynthesizer:
             if kind == "click":
                 btn = e.get("button", "left")
                 cues.append(f"{t} click → {btn}{(' on ' + loc) if loc else ''}")
+            elif kind == "drag":
+                # Drag events contain start and end coordinates, essential for drawing/positioning actions
+                # Format: "ts drag → (start_x,start_y) to (end_x,end_y) [duration] [on element]"
+                start_x = e.get("start_x", 0)
+                start_y = e.get("start_y", 0)
+                end_x = e.get("end_x", 0)
+                end_y = e.get("end_y", 0)
+                duration = float(e.get("duration") or 0.0)
+                btn = e.get("button", "left")
+                # Calculate drag distance for context
+                distance = ((end_x - start_x) ** 2 + (end_y - start_y) ** 2) ** 0.5
+                # Format end element locator if available
+                end_loc = ""
+                if e.get("end_primaryLocator") or e.get("end_selector"):
+                    end_loc = self._format_locator(
+                        {
+                            "primaryLocator": e.get("end_primaryLocator"),
+                            "selector": e.get("end_selector"),
+                            "element": e.get("end_element"),
+                        }
+                    )
+                detail_parts = [
+                    f"({start_x:.0f},{start_y:.0f}) → ({end_x:.0f},{end_y:.0f})",
+                    f"distance={distance:.0f}px",
+                    f"{duration:.2f}s",
+                ]
+                if end_loc:
+                    detail_parts.append(f"to {end_loc}")
+                cues.append(f"{t} drag → {btn} {' '.join(detail_parts)}")
             elif kind == "dom_probe":
                 cues.append(f"{t} probe → {loc or 'target'}")
             elif kind == "scroll":
@@ -508,10 +601,26 @@ class PlanSynthesizer:
                     f"{t} key_down → {combo}{(' into ' + focus_loc) if focus_loc else ''}"
                 )
             elif kind == "key_up":
+                key = e.get("key") or ""
                 focus_loc = self._format_locator(
                     {"focus": e.get("focus"), "selector": e.get("selector")}
                 )
-                cues.append(f"{t} key_up{(' on ' + focus_loc) if focus_loc else ''}")
+                cues.append(
+                    f"{t} key_up → {key}{(' on ' + focus_loc) if focus_loc else ''}"
+                )
+            elif kind == "key_hold":
+                # Extract the key/combo and duration to show what character was held and for how long
+                # This is critical for understanding typing patterns and repeated characters
+                key = e.get("key")
+                combo = e.get("combo")
+                duration = float(e.get("duration") or 0.0)
+                detail = combo or key or "key"
+                focus_loc = self._format_locator(
+                    {"focus": e.get("focus"), "selector": e.get("selector")}
+                )
+                cues.append(
+                    f"{t} key_hold → {detail} for {duration:.2f}s{(' on ' + focus_loc) if focus_loc else ''}"
+                )
             else:
                 cues.append(f"{t} {kind}")
         return cues
@@ -603,7 +712,8 @@ class PlanSynthesizer:
             return None
 
         for e in events or []:
-            if e.get("kind") not in {"click", "dom_probe", "key_down", "key_up"}:
+            # Collect DOM context from all interactive events including drag operations
+            if e.get("kind") not in {"click", "drag", "dom_probe", "key_down", "key_up"}:
                 continue
             k = key_for(e)
             if not k or k in seen_keys:
@@ -722,12 +832,64 @@ class PlanSynthesizer:
             "- Prefer concise, outcome-focused steps. Each step should describe a meaningful action or goal.",
             "- Write instructions that are resilient to minor UI changes.",
             "",
-            "Computer Use toolbelt (reference these capabilities in your instructions): "
-            "navigate(url), open_web_browser(), wait_5_seconds(), go_back(), go_forward(), search(), "
-            "click_at(x,y), hover_at(x,y), type_text_at(x,y,text, press_enter=false, clear_before_typing=true), "
-            "key_combination(keys), scroll_document(direction), scroll_at(x,y,direction,magnitude), drag_and_drop(x,y,destination_x,destination_y).",
+            "=== GEMINI COMPUTER USE ACTIONS (CRITICAL) ===",
+            "The agent executing this plan has access to the following Computer Use actions.",
+            "Your step instructions MUST reference these actions when describing what needs to be done:",
             "",
-            'Write instructions in natural language that express intent (e.g., "Select the pen tool", "Draw \'hi\' on the canvas", "Save the document").',
+            "NAVIGATION:",
+            '  • navigate(url) - Go directly to a URL: "Navigate to https://example.com"',
+            '  • open_web_browser() - Open browser: "Open the web browser"',
+            '  • go_back() / go_forward() - Browser navigation: "Go back to the previous page"',
+            '  • search() - Open search engine: "Open Google search"',
+            "",
+            "INTERACTION:",
+            '  • click_at(x, y) - Click at coordinates: "Click the submit button"',
+            '  • hover_at(x, y) - Hover for menus: "Hover over the File menu to reveal options"',
+            '  • type_text_at(x, y, text, press_enter, clear_before_typing) - Type text: "Type \'{searchTerm}\' into the search box and press Enter"',
+            '  • key_combination(keys) - Press keyboard shortcuts: "Press Control+A to select all" or "Press Enter to submit"',
+            "",
+            "SCROLLING:",
+            '  • scroll_document(direction) - Scroll the page: "Scroll down to see more results"',
+            '  • scroll_at(x, y, direction, magnitude) - Scroll specific element: "Scroll down within the chat window"',
+            "",
+            "DRAG AND DRAW:",
+            '  • drag_and_drop(x, y, destination_x, destination_y) - Drag from one point to another',
+            '    - Use for DRAWING: "Draw a line/shape on the canvas" (maps to drag motion)',
+            '    - Use for REPOSITIONING: "Drag the slider to adjust volume"',
+            '    - Use for DRAG-DROP: "Drag the file to the upload area"',
+            "",
+            "TIMING:",
+            '  • wait_5_seconds() - Wait for content to load: "Wait for the page to finish loading"',
+            "",
+            "INSTRUCTION MAPPING EXAMPLES (how recorded events → step instructions):",
+            '  Recorded: "7.5s drag → left (200,300) → (450,320) distance=250px"',
+            '  Instruction: "Draw a horizontal line on the canvas using the pen tool"',
+            '  → Agent will use: drag_and_drop(x=200, y=300, destination_x=450, destination_y=320)',
+            "",
+            '  Recorded: "3.2s click → left on button[aria-label=\'Submit\']"',
+            '  Instruction: "Click the Submit button to send the form"',
+            '  → Agent will use: click_at(x, y) based on button location',
+            "",
+            '  Recorded: "5.1s key_hold → h for 0.06s on input[type=\'text\']"',
+            '           "5.2s key_hold → i for 0.05s on input[type=\'text\']"',
+            '  Instruction: "Type \'{greeting}\' into the text input field"',
+            '  → Agent will use: type_text_at(x, y, text="{greeting}", press_enter=false)',
+            "",
+            '  Recorded: "2.8s scroll → Δx=0, Δy=450"',
+            '  Instruction: "Scroll down the page to view more content"',
+            '  → Agent will use: scroll_document(direction="down")',
+            "",
+            "CRITICAL DRAG INSTRUCTION RULES:",
+            "- When you see DRAG events in the timeline, analyze the context:",
+            '  • If on a DRAWING canvas (tldraw, whiteboard, etc.) → "Draw [shape/text] on the canvas"',
+            '  • If moving a UI element (slider, resize handle) → "Adjust the [element] by dragging"',
+            '  • If dragging between containers → "Drag the [item] to [destination]"',
+            "- The agent will automatically use drag_and_drop() with the appropriate coordinates",
+            "- DO NOT write rigid instructions like \"Drag from (100,200) to (500,600)\"",
+            '- INSTEAD write intent: "Draw the letter \'h\' on the canvas" or "Slide the volume control to maximum"',
+            "",
+            'Write instructions in natural language that express INTENT and reference the actions above.',
+            'The Computer Use agent will map your instructions to the appropriate action based on context.',
         ]
 
         normalized_start_url = (start_url or "").strip()
@@ -777,7 +939,17 @@ class PlanSynthesizer:
             prompt_lines.append("- What is the end result they want?")
             prompt_lines.append("")
             prompt_lines.append("Then write instructions that express that goal, not the mechanical steps.")
-            prompt_lines.append('Example: If you see pen tool selection + drawing strokes, write "Draw [description]" not "Click pen, click canvas, drag".')
+            prompt_lines.append("")
+            prompt_lines.append("MAP INTERACTIONS TO COMPUTER USE ACTIONS:")
+            prompt_lines.append('• If you see DRAG events → Use drag_and_drop() action:')
+            prompt_lines.append('  - Drawing context: "Draw [description] on the canvas"')
+            prompt_lines.append('  - UI manipulation: "Adjust the [slider/control] by dragging"')
+            prompt_lines.append('• If you see CLICK events → Use click_at() action:')
+            prompt_lines.append('  - "Click the [button/link] to [action]"')
+            prompt_lines.append('• If you see KEY_HOLD events (typing) → Use type_text_at() action:')
+            prompt_lines.append('  - "Type \'{variableName}\' into the [field]"')
+            prompt_lines.append('• If you see SCROLL events → Use scroll_document() or scroll_at() action:')
+            prompt_lines.append('  - "Scroll down to view more content"')
             prompt_lines.append("")
             prompt_lines.extend(lines_to_use)
 
@@ -793,8 +965,18 @@ class PlanSynthesizer:
             prompt_lines.extend(dom_bullets)
 
         if recording.transcript:
-            prompt_lines.append("Transcribed narration (chronological):")
+            prompt_lines.append("")
+            prompt_lines.append("USER NARRATION (voice-over recorded during the session):")
+            prompt_lines.append("")
+            prompt_lines.append("The user narrated their actions while recording. Use this to understand:")
+            prompt_lines.append("- The INTENT behind each action (what they're trying to accomplish)")
+            prompt_lines.append("- Variable names they mention verbally (e.g., 'username', 'password', 'search term')")
+            prompt_lines.append("- Business logic and reasoning for the workflow")
+            prompt_lines.append("- Context for ambiguous UI interactions")
+            prompt_lines.append("- Correlate timestamps with interaction timeline to see what was said during each action")
+            prompt_lines.append("")
             prompt_lines.append(recording.transcript.strip())
+            prompt_lines.append("")
 
         prompt_lines.append("")
         prompt_lines.append("FINAL REMINDERS:")

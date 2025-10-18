@@ -485,7 +485,7 @@ async def teach_start(payload: Dict[str, Any] = Body(default={})):
 
 
 @app.post("/teach/stop")
-async def teach_stop():
+async def teach_stop(payload: Dict[str, Any] = Body(default={})):
     result = await teach_manager.stop()
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("reason", "no active session"))
@@ -515,10 +515,18 @@ async def teach_stop():
         except KeyError:
             logger.debug("Skipping malformed marker payload: %s", marker)
 
+    # Extract optional audio from frontend payload
+    audio_wav_base64 = payload.get("audioWavBase64")
+    if audio_wav_base64 and isinstance(audio_wav_base64, str):
+        logger.info("Received audio data from teach session (%d chars)", len(audio_wav_base64))
+    else:
+        audio_wav_base64 = None
+
     bundle = RecordingBundle(
         frames=frame_objects,
         markers=marker_objects,
         events=events,
+        audio_wav_base64=audio_wav_base64,
     )
     stored = await recording_store.complete(recording_id, bundle)
     bundle_payload = stored.bundle.model_dump(by_alias=True) if stored.bundle else {}
@@ -529,6 +537,7 @@ async def teach_stop():
         "frames": bundle_payload.get("frames", []),
         "markers": bundle_payload.get("markers", []),
         "events": stored.events,
+        "hasAudio": audio_wav_base64 is not None,
     }
 
 
@@ -567,21 +576,24 @@ async def ws_teach(ws: WebSocket, teach_id: str):
             page = session.page
 
             if msg_type == "mouse_move":
-                await page.mouse.move(payload["x"], payload["y"])
+                x = payload["x"]
+                y = payload["y"]
+                await page.mouse.move(x, y)
+                # Track movement for drag detection (checks if mouse is down and updates state)
+                session.record_mouse_move(x, y)
             elif msg_type == "mouse_down":
                 button = {0: "left", 1: "middle", 2: "right"}.get(
                     int(payload.get("button", 0)), "left"
                 )
-                await page.mouse.move(payload["x"], payload["y"])
+                x = payload["x"]
+                y = payload["y"]
+                await page.mouse.move(x, y)
                 await page.mouse.down(button=button)
-                click_meta = await _describe_click_target(page, payload["x"], payload["y"])
-                event_payload: Dict[str, Any] = {
-                    "x": payload["x"],
-                    "y": payload["y"],
-                    "button": button,
-                }
+                # Gather DOM metadata for the click target
+                click_meta = await _describe_click_target(page, x, y)
+                mouse_down_extra: Dict[str, Any] = {}
                 if click_meta:
-                    event_payload.update(
+                    mouse_down_extra.update(
                         {
                             "element": click_meta.get("element"),
                             "actionable": click_meta.get("actionable"),
@@ -591,12 +603,29 @@ async def ws_teach(ws: WebSocket, teach_id: str):
                             "selectorCandidates": click_meta.get("selectorCandidates"),
                         }
                     )
-                session.log("click", **event_payload)
+                # Record mouse down state - event will be logged on mouse_up based on movement
+                session.record_mouse_down(x, y, button, extra=mouse_down_extra)
             elif msg_type == "mouse_up":
                 button = {0: "left", 1: "middle", 2: "right"}.get(
                     int(payload.get("button", 0)), "left"
                 )
+                x = payload["x"]
+                y = payload["y"]
                 await page.mouse.up(button=button)
+                # Gather DOM metadata for the release target (useful for drag end location)
+                click_meta = await _describe_click_target(page, x, y)
+                mouse_up_extra: Dict[str, Any] = {}
+                if click_meta:
+                    mouse_up_extra.update(
+                        {
+                            "element": click_meta.get("element"),
+                            "actionable": click_meta.get("actionable"),
+                            "selector": click_meta.get("bestSelector"),
+                            "primaryLocator": click_meta.get("primaryLocator"),
+                        }
+                    )
+                # This will automatically determine if it was a click or drag and log appropriately
+                session.record_mouse_up(x, y, button, extra=mouse_up_extra)
             elif msg_type == "wheel":
                 await page.mouse.wheel(
                     delta_x=int(payload.get("deltaX", 0)),
@@ -861,6 +890,7 @@ class RunState:
         self.start_url = start_url
         self.status = "pending"
         self.created_at = datetime.utcnow()
+        self.completed_at: Optional[datetime] = None
         self.abort_event = asyncio.Event()
         self._subscribers: set[asyncio.Queue[Dict[str, object]]] = set()
         self._lock = asyncio.Lock()
@@ -948,14 +978,28 @@ class RunState:
 
 
 class RunRegistry:
+    """
+    Registry for managing active and recently completed runs.
+
+    Completed runs are kept in the registry for a configurable TTL (default 5 minutes)
+    to allow screenshot capture and status queries after run completion.
+    """
+
+    # Time-to-live for completed runs in seconds (5 minutes)
+    COMPLETED_RUN_TTL = 300
+
     def __init__(self) -> None:
         self._runs: Dict[str, RunState] = {}
         self._lock = asyncio.Lock()
+        self._cleanup_task: Optional[asyncio.Task[None]] = None
 
     async def create(self, plan: StoredPlan, *, start_url: Optional[str]) -> RunState:
         state = RunState(plan, start_url=start_url)
         async with self._lock:
             self._runs[state.run_id] = state
+        # Start cleanup task if not already running
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         return state
 
     async def get(self, run_id: str) -> Optional[RunState]:
@@ -963,8 +1007,39 @@ class RunRegistry:
             return self._runs.get(run_id)
 
     async def remove(self, run_id: str) -> None:
+        """Manually remove a run from the registry (typically not needed)."""
         async with self._lock:
             self._runs.pop(run_id, None)
+
+    async def _cleanup_loop(self) -> None:
+        """
+        Background task that periodically removes old completed runs.
+
+        This keeps the registry from growing unbounded while still allowing
+        screenshot capture for recently completed runs.
+        """
+        try:
+            while True:
+                await asyncio.sleep(60)  # Check every minute
+                await self._cleanup_old_runs()
+        except asyncio.CancelledError:
+            pass
+
+    async def _cleanup_old_runs(self) -> None:
+        """Remove runs that completed more than TTL seconds ago."""
+        now = datetime.utcnow()
+        to_remove = []
+
+        async with self._lock:
+            for run_id, state in self._runs.items():
+                if state.completed_at is not None:
+                    age = (now - state.completed_at).total_seconds()
+                    if age > self.COMPLETED_RUN_TTL:
+                        to_remove.append(run_id)
+
+            for run_id in to_remove:
+                self._runs.pop(run_id, None)
+                logger.debug("Cleaned up completed run %s (age exceeded TTL)", run_id)
 
 
 run_registry = RunRegistry()
@@ -1119,6 +1194,49 @@ async def recordings_bundle(recording_id: str) -> Dict[str, object]:
         return await recording_store.get_bundle_payload(recording_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Recording not found") from exc
+
+
+@app.delete("/recordings/{recording_id}/audio")
+async def recordings_delete_audio(recording_id: str) -> Dict[str, object]:
+    """
+    Delete audio data from a recording while preserving the transcript.
+
+    This endpoint is useful for saving storage space after transcription
+    has been completed. The transcript remains available for plan synthesis.
+
+    Returns:
+        Success status and confirmation message
+    """
+    try:
+        stored = await recording_store.get(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Recording not found") from exc
+
+    if stored.bundle is None:
+        raise HTTPException(status_code=400, detail="Recording has no bundle")
+
+    # Check if audio exists
+    if not stored.bundle.audio_wav_base64:
+        return {
+            "ok": True,
+            "message": "No audio data to delete",
+            "had_transcript": bool(stored.bundle.transcript),
+        }
+
+    # Create updated bundle without audio
+    try:
+        updated_bundle = stored.bundle.model_copy(update={"audio_wav_base64": None})
+    except AttributeError:  # pragma: no cover - Pydantic v1 fallback
+        updated_bundle = stored.bundle.copy(update={"audio_wav_base64": None})  # type: ignore[attr-defined]
+
+    # Save updated bundle
+    await recording_store.complete(recording_id, updated_bundle)
+
+    return {
+        "ok": True,
+        "message": "Audio data deleted successfully",
+        "transcript_preserved": bool(updated_bundle.transcript),
+    }
 
 
 @app.post("/plans/synthesize", response_model=PlanSynthesisResponse)
@@ -1282,7 +1400,10 @@ async def runs_start(request: RunStartRequest) -> RunStartResponse:
                 {"type": "runner_status", "message": "failed", "error": str(exc)}
             )
         finally:
-            await run_registry.remove(state.run_id)
+            # Mark the run as completed/finished but keep it in the registry
+            # so screenshots and status can still be queried after completion.
+            # The run will eventually be cleaned up by the registry's TTL mechanism.
+            state.completed_at = datetime.utcnow()
 
     state.task = asyncio.create_task(_runner_task(), name=f"run-{state.run_id}")
     await state.publish(
@@ -1304,6 +1425,51 @@ async def runs_abort(run_id: str) -> RunAbortResponse:
         raise HTTPException(status_code=404, detail="Run not found")
     await state.request_abort()
     return RunAbortResponse(run_id=state.run_id, status="aborting")
+
+
+class RunCaptureResponse(APIModel):
+    """Response for capturing a screenshot from an active run."""
+
+    ok: bool = Field(..., description="Whether the capture was successful")
+    frame: Optional[str] = Field(None, description="Base64-encoded PNG screenshot")
+    message: Optional[str] = Field(None, description="Error or status message")
+
+
+@app.post("/runs/{run_id}/capture", response_model=RunCaptureResponse)
+async def runs_capture(run_id: str) -> RunCaptureResponse:
+    """
+    Capture the latest screenshot from an active run.
+
+    This endpoint returns the most recent frame that was captured during the run.
+    If no frame has been captured yet, or if the run doesn't exist, an error is returned.
+    """
+    state = await run_registry.get(run_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    # Access the latest frame under the lock to ensure thread safety
+    async with state._lock:
+        latest_frame = state._latest_frame
+
+    if not latest_frame:
+        return RunCaptureResponse(
+            ok=False,
+            message="No screenshot available yet. The run may not have started rendering."
+        )
+
+    # Extract the base64 frame from the latest_frame message
+    frame_b64 = latest_frame.get("frame")
+    if not frame_b64 or not isinstance(frame_b64, str):
+        return RunCaptureResponse(
+            ok=False,
+            message="Screenshot data is invalid or corrupted."
+        )
+
+    return RunCaptureResponse(
+        ok=True,
+        frame=frame_b64,
+        message="Screenshot captured successfully"
+    )
 
 
 async def _websocket_sender(websocket: WebSocket, queue: asyncio.Queue[Dict[str, object]]) -> None:

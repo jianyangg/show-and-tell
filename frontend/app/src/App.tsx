@@ -43,7 +43,7 @@ const theme = createTheme({
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const { startTeach, stopTeach, isRecording } = useTeachSession(canvasRef);
-  const { startRun, confirmPrompt, submitVariables, abortVariables } = useRunSession();
+  const { startRun, confirmPrompt, submitVariables, abortVariables, connectToRun } = useRunSession();
   const {
     synthesizePlan,
     savePlan,
@@ -87,6 +87,7 @@ export default function App() {
         onSavePlan={savePlan}
         onLoadPlan={loadPlan}
         onRefreshPlans={refreshPlans}
+        onConnectToRun={connectToRun}
         isRecording={isRecording}
         hasRecording={hasRecording}
         hasPlan={hasPlan}

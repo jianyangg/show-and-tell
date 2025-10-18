@@ -1,4 +1,3 @@
-<!-- # initial plan -->
 # 0) Executive summary
 
 **Goal.** A general **audio+visual learning** agent that watches you demonstrate a task inside an **embedded iframe**, learns the steps (using voice to infer intent), and then **replays** that task reliably on any site — all **browser-only**, with execution driven in the backend via Chromium + Playwright and **Gemini 2.5 Computer Use** (screenshot→action→screenshot loop). ([Google AI for Developers][1])

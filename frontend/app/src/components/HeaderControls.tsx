@@ -67,6 +67,7 @@ interface HeaderControlsProps {
   onSavePlan: (name: string) => Promise<void> | void;
   onLoadPlan: (planId: string) => Promise<void> | void;
   onRefreshPlans: () => Promise<void> | void;
+  onConnectToRun?: (runId: string) => void;
   isRecording: boolean;
   hasRecording: boolean;
   hasPlan: boolean;
@@ -82,6 +83,7 @@ export function HeaderControls({
   onSavePlan,
   onLoadPlan,
   onRefreshPlans,
+  onConnectToRun,
   isRecording,
   hasRecording,
   hasPlan,
@@ -91,6 +93,8 @@ export function HeaderControls({
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [saveName, setSaveName] = useState('');
   const [selectedPlanId, setSelectedPlanId] = useState('');
+  const [connectDialogOpen, setConnectDialogOpen] = useState(false);
+  const [runIdInput, setRunIdInput] = useState('');
 
   const { apiBase, setApiBase, startUrl, setStartUrl, synthProvider, setSynthProvider, planDetail } =
     useAppStore((state) => ({
@@ -175,6 +179,21 @@ export function HeaderControls({
     }
     await onSavePlan(saveName.trim());
     setSaveDialogOpen(false);
+  };
+
+  const openConnectDialog = () => {
+    setRunIdInput('');
+    setConnectDialogOpen(true);
+  };
+
+  const closeConnectDialog = () => setConnectDialogOpen(false);
+
+  const handleConnectConfirm = () => {
+    if (!runIdInput.trim() || !onConnectToRun) {
+      return;
+    }
+    onConnectToRun(runIdInput.trim());
+    setConnectDialogOpen(false);
   };
 
   return (
@@ -284,6 +303,11 @@ export function HeaderControls({
             <Button variant="outlined" color="inherit" onClick={openSaveDialog} disabled={!hasPlan}>
               Save plan
             </Button>
+            {onConnectToRun && (
+              <Button variant="outlined" color="info" onClick={openConnectDialog}>
+                Connect to run
+              </Button>
+            )}
           </ActionsGroup>
         </HeaderRow>
       </Toolbar>
@@ -306,6 +330,28 @@ export function HeaderControls({
           <Button onClick={closeSaveDialog}>Cancel</Button>
           <Button onClick={handleSaveConfirm} variant="contained">
             Save
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog open={connectDialogOpen} onClose={closeConnectDialog} fullWidth maxWidth="sm">
+        <DialogTitle>Connect to existing run</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="textSecondary" sx={{ mb: 2 }}>
+            Enter a run ID from an MCP-started run or previous session
+          </Typography>
+          <TextField
+            autoFocus
+            fullWidth
+            label="Run ID"
+            value={runIdInput}
+            onChange={(event) => setRunIdInput(event.target.value)}
+            placeholder="e.g., 50ae8591486841d2806e0e56442470c5"
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={closeConnectDialog}>Cancel</Button>
+          <Button onClick={handleConnectConfirm} variant="contained" disabled={!runIdInput.trim()}>
+            Connect
           </Button>
         </DialogActions>
       </Dialog>

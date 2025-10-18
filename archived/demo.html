@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Acme Cloud Portal (Demo)</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: system-ui, sans-serif;
+        background: #f8fafc;
+        color: #0f172a;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        padding: 2rem;
+      }
+      .card-stack {
+        position: relative;
+        width: min(420px, 90vw);
+      }
+      .card {
+        width: 100%;
+        padding: 2.5rem;
+        border-radius: 18px;
+        border: 1px solid #d4d4d8;
+        background: #ffffff;
+        box-shadow: 0 12px 35px rgba(15, 23, 42, 0.12);
+        display: flex;
+        flex-direction: column;
+        gap: 1.75rem;
+        transition: transform 0.3s ease, opacity 0.3s ease;
+        position: absolute;
+        top: 0;
+        left: 0;
+      }
+      .card.hidden {
+        opacity: 0;
+        pointer-events: none;
+        transform: translateY(24px);
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.4rem;
+        text-align: center;
+      }
+      p {
+        margin: 0;
+      }
+      label {
+        display: flex;
+        flex-direction: column;
+        gap: 0.4rem;
+        font-size: 0.95rem;
+      }
+      input {
+        border-radius: 12px;
+        border: 1px solid #cbd5f5;
+        padding: 0.7rem 0.85rem;
+        background: #f1f5f9;
+        color: #0f172a;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease;
+      }
+      input:focus {
+        outline: none;
+        border-color: #2563eb;
+        box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+        background: #ffffff;
+      }
+      button {
+        cursor: pointer;
+        border: none;
+        border-radius: 10px;
+        padding: 0.75rem 1.2rem;
+        font-weight: 600;
+        color: #ffffff;
+        background: #2563eb;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+      }
+      button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 12px 22px rgba(37, 99, 235, 0.25);
+      }
+      button:disabled {
+        opacity: 0.6;
+        box-shadow: none;
+        cursor: not-allowed;
+      }
+      .button-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+        gap: 1rem;
+      }
+      .counter-button {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 1.1rem 0.8rem;
+        border-radius: 14px;
+        color: #ffffff;
+        font-weight: 600;
+        font-size: 1rem;
+        border: none;
+        cursor: pointer;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+      }
+      .counter-button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 14px 26px rgba(15, 23, 42, 0.2);
+      }
+      .counter-label {
+        margin-top: 0.4rem;
+        font-size: 0.8rem;
+        opacity: 0.9;
+        font-weight: 500;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card-stack">
+      <section class="card" id="login-card">
+        <div>
+          <h1>Acme Portal Login</h1>
+          <p style="margin-top: 0.35rem; text-align: center; color: #4b5563">
+            Enter any email and password to continue.
+          </p>
+        </div>
+
+        <label>
+          Email
+          <input type="email" id="email" autocomplete="username" placeholder="you@example.com" />
+        </label>
+
+        <label>
+          Password
+          <input type="password" id="password" autocomplete="current-password" placeholder="Enter password" />
+        </label>
+
+        <button type="button" id="login-btn">Sign In</button>
+      </section>
+
+      <section class="card hidden" id="dashboard-card" aria-hidden="true">
+        <div>
+          <h1>Welcome back!</h1>
+          <p style="margin-top: 0.35rem; text-align: center; color: #4b5563">
+            Tap a button to increment its counter.
+          </p>
+        </div>
+
+        <div class="button-grid">
+          <button type="button" class="counter-button" data-color="red" style="background: #ef4444">
+            Red
+            <span class="counter-label">Count: <span class="count">0</span></span>
+          </button>
+          <button type="button" class="counter-button" data-color="green" style="background: #10b981">
+            Green
+            <span class="counter-label">Count: <span class="count">0</span></span>
+          </button>
+          <button type="button" class="counter-button" data-color="blue" style="background: #3b82f6">
+            Blue
+            <span class="counter-label">Count: <span class="count">0</span></span>
+          </button>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      const loginBtn = document.getElementById('login-btn');
+      const loginCard = document.getElementById('login-card');
+      const dashboardCard = document.getElementById('dashboard-card');
+
+      loginBtn?.addEventListener('click', () => {
+        loginCard?.classList.add('hidden');
+        dashboardCard?.classList.remove('hidden');
+        dashboardCard?.setAttribute('aria-hidden', 'false');
+      });
+
+      document.querySelectorAll('.counter-button').forEach((button) => {
+        button.addEventListener('click', () => {
+          const countNode = button.querySelector('.count');
+          if (!countNode) {
+            return;
+          }
+          const current = parseInt(countNode.textContent || '0', 10);
+          countNode.textContent = String(current + 1);
+        });
+      });
+    </script>
+  </body>
+</html>

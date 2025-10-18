@@ -7,6 +7,7 @@ import {
 } from '../store/appStore';
 import { buildEventEntries, RawEvent } from '../utils/events';
 import { normalizeStartUrl } from '../utils/startUrl';
+import { AudioRecorder } from '../utils/audioRecorder';
 
 function buildTeachWsUrl(apiBase: string, teachId: string): string {
   const url = new URL(apiBase);
@@ -21,6 +22,7 @@ export function useTeachSession(canvasRef: React.RefObject<HTMLCanvasElement>) {
   const detachListenersRef = useRef<(() => void) | null>(null);
   const markersRef = useRef<RecordingMarker[]>([]);
   const recordingFramesRef = useRef<RecordingFrame[]>([]);
+  const audioRecorderRef = useRef<AudioRecorder | null>(null);
 
   const {
     apiBase,
@@ -191,6 +193,12 @@ export function useTeachSession(canvasRef: React.RefObject<HTMLCanvasElement>) {
       detach();
       detachListenersRef.current = null;
     }
+    // Clean up audio recorder if active
+    const audioRecorder = audioRecorderRef.current;
+    if (audioRecorder && audioRecorder.isRecording()) {
+      audioRecorder.abort();
+    }
+    audioRecorderRef.current = null;
     window.removeEventListener('keydown', markerHotkeyListener);
     setTeachActive(false);
     setIsRecording(false);
@@ -229,6 +237,25 @@ export function useTeachSession(canvasRef: React.RefObject<HTMLCanvasElement>) {
       setRecordingStartedAt(performance.now());
       setTeachActive(true);
       setIsRecording(true);
+
+      // Start audio recording if supported
+      if (AudioRecorder.isSupported()) {
+        try {
+          const audioRecorder = new AudioRecorder();
+          await audioRecorder.start();
+          audioRecorderRef.current = audioRecorder;
+          addConsoleEntry('Audio', 'Microphone recording started');
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn('Failed to start audio recording:', message);
+          addConsoleEntry('Audio', `Recording disabled: ${message}`);
+          // Don't fail the teach session if audio fails - continue without it
+        }
+      } else {
+        console.info('Audio recording not supported in this browser');
+        addConsoleEntry('Audio', 'Audio recording not supported');
+      }
+
       const socketUrl = buildTeachWsUrl(apiBase, teachId);
       const socket = new WebSocket(socketUrl);
       teachSocketRef.current = socket;
@@ -315,10 +342,41 @@ export function useTeachSession(canvasRef: React.RefObject<HTMLCanvasElement>) {
 
   const stopTeach = useCallback(async () => {
     setStatus('Stopping teach session…');
+
+    // Stop audio recording first (before cleanup)
+    let audioWavBase64: string | null = null;
+    const audioRecorder = audioRecorderRef.current;
+    if (audioRecorder && audioRecorder.isRecording()) {
+      try {
+        addConsoleEntry('Audio', 'Stopping audio recording...');
+        audioWavBase64 = await audioRecorder.stop();
+        if (audioWavBase64) {
+          const sizeKB = Math.round((audioWavBase64.length * 0.75) / 1024); // base64 is ~4/3 of original
+          addConsoleEntry('Audio', `Recording saved (${sizeKB} KB)`);
+        } else {
+          addConsoleEntry('Audio', 'No audio data captured');
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('Failed to stop audio recording:', message);
+        addConsoleEntry('Audio', `Failed to save: ${message}`);
+        // Continue without audio
+      }
+    }
+
     try {
       cleanupTeach();
+
+      // Send stop request with optional audio
+      const payload: { audioWavBase64?: string } = {};
+      if (audioWavBase64) {
+        payload.audioWavBase64 = audioWavBase64;
+      }
+
       const response = await fetch(`${apiBase.replace(/\/$/, '')}/teach/stop`, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       });
       if (!response.ok) {
         throw new Error(await response.text());
@@ -328,6 +386,7 @@ export function useTeachSession(canvasRef: React.RefObject<HTMLCanvasElement>) {
         frames?: RecordingFrame[];
         markers?: RecordingMarker[];
         events?: RawEvent[];
+        hasAudio?: boolean;
       };
       setLatestRecording({
         recordingId: detail.recordingId,
@@ -345,8 +404,9 @@ export function useTeachSession(canvasRef: React.RefObject<HTMLCanvasElement>) {
       setMarkers(markers);
       setEventEntries(buildEventEntries((detail.events ?? []) as RawEvent[]));
       const savedCount = recordingFramesRef.current.length;
-      setStatus(`Recording ${detail.recordingId} saved (${savedCount} frames).`);
-      addConsoleEntry('Teach', `Recording ${detail.recordingId} saved.`);
+      const audioInfo = detail.hasAudio ? ' with audio' : '';
+      setStatus(`Recording ${detail.recordingId} saved (${savedCount} frames${audioInfo}).`);
+      addConsoleEntry('Teach', `Recording ${detail.recordingId} saved${audioInfo}.`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(`Failed to stop teach session: ${message}`);

@@ -335,7 +335,8 @@ export function useRunSession() {
       confirmPrompt,
       submitVariables,
       abortVariables,
+      connectToRun,
     }),
-    [abortVariables, confirmPrompt, startRun, submitVariables]
+    [abortVariables, confirmPrompt, connectToRun, startRun, submitVariables]
   );
 }

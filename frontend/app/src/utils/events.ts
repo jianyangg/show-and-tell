@@ -8,6 +8,10 @@ export interface RawEvent {
   combo?: string;
   key?: string;
   detail?: string;
+  start_x?: number;
+  start_y?: number;
+  end_x?: number;
+  end_y?: number;
 }
 
 function formatTimestamp(value?: number): string {
@@ -46,6 +50,18 @@ function buildDetail(event: RawEvent): string {
     case 'keyup':
       return `→ ${event.combo || event.key || '?'}`;
     case 'drag':
+      // Show drag start→end coordinates and distance for better visibility
+      if (
+        typeof event.start_x === 'number' &&
+        typeof event.start_y === 'number' &&
+        typeof event.end_x === 'number' &&
+        typeof event.end_y === 'number'
+      ) {
+        const dx = event.end_x - event.start_x;
+        const dy = event.end_y - event.start_y;
+        const distance = Math.round(Math.sqrt(dx * dx + dy * dy));
+        return `→ (${Math.round(event.start_x)},${Math.round(event.start_y)}) to (${Math.round(event.end_x)},${Math.round(event.end_y)}) ${distance}px`;
+      }
       return event.detail ? `→ ${event.detail}` : '';
     default:
       if (event.key) {

@@ -1,14 +1,15 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-The FastAPI runner lives in `backend/app`; `api.py` exposes HTTP+WS endpoints, `synthesis.py` wraps Gemini 2.5 Pro/GPT-5 for plan generation, and `runner.py` drives the Playwright + Computer Use loop. In-memory stores reside in `storage.py`. The screencast viewer is `frontend/index.html`. `scripts/run_demo.sh` boots the backend and leaves it running so you can perform a manual Record → Synthesize → Run loop. `test_playwright_example.py` remains a Playwright smoke helper.
+The FastAPI runner lives in `backend/app`; `api.py` exposes HTTP+WS endpoints, `synthesis.py` wraps Gemini 2.5 Pro for plan generation, and `runner.py` drives the Playwright + Computer Use loop. In-memory stores reside in `storage.py`. The screencast viewer is `frontend/index.html`. `scripts/run_demo.sh` boots the backend and leaves it running so you can perform a manual Record → Synthesize → Run loop. `test_playwright_example.py` remains a Playwright smoke helper.
 
 ## Build, Test, and Development Commands
 - `python -m venv .venv && source .venv/bin/activate`: create and enter the local virtualenv.
 - `pip install -r backend/requirements.txt`: install backend and automation dependencies.
 - `python -m playwright install chromium`: fetch the headless browser required by the runner.
 - `uvicorn backend.app.api:app --reload`: start the API server with autoreload on port 8000.
-- `yarn && yarn dev`: install and launch the frontend viewer at `localhost:5173`.
+- `scripts/run_demo.sh`: spin up the server and leave it running; launch the four-button flow from `frontend/index.html`.
+- `python test_playwright_example.py`: run the Playwright smoke script that exercises example.com.
 - `USER_MANUAL.md`: end-user instructions for launching runs from `frontend/index.html`.
 
 ## Coding Style & Naming Conventions
