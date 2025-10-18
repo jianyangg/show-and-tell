@@ -1,0 +1,731 @@
+<!-- we have to run this in a separate directory -->
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Three.js FPV Cup Demo (semantic selectors)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:,">
+  <style>
+    html,body { margin:0; height:100%; background:#101216; color:#e6e6e6; font:14px/1.4 Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    #hud { position:fixed; inset:0; pointer-events:none; }
+    #crosshair {
+      position:absolute; left:50%; top:50%; width:18px; height:18px; transform:translate(-50%,-50%);
+      border-radius:50%; box-shadow:0 0 0 1px #b0b0b0, inset 0 0 0 1px #b0b0b0;
+      opacity:.6;
+    }
+    #panel {
+      position:fixed; left:12px; bottom:12px; width:380px; max-width:calc(100vw - 24px);
+      background:rgba(20,22,28,.9); border:1px solid #2a2e37; border-radius:10px; padding:10px 12px;
+      backdrop-filter:saturate(1.2) blur(6px); pointer-events:auto;
+    }
+    #panel pre { margin:6px 0 0; max-height:180px; overflow:auto; background:#0f1115; padding:8px; border-radius:6px; border:1px solid #2a2e37; }
+    #help {
+      position:fixed; right:12px; bottom:12px; width:320px; max-width:calc(100vw - 24px);
+      background:rgba(20,22,28,.9); border:1px solid #2a2e37; border-radius:10px; padding:10px 12px; display:none;
+    }
+    #overlay {
+      position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:#0c0f14; color:#e6e6e6;
+      font-size:20px; cursor:pointer; z-index:10;
+    }
+    button { background:#2a2e37; color:#e6e6e6; border:1px solid #3a3f4c; border-radius:8px; padding:6px 10px; cursor:pointer; }
+    button:hover { background:#394050; }
+    a { color:#a4d1ff; }
+  </style>
+  <script async src="https://unpkg.com/es-module-shims@1.11.0/dist/es-module-shims.js"></script>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/examples/jsm/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="overlay">Click to start (Pointer Lock)</div>
+  <div id="hud"><div id="crosshair"></div></div>
+
+  <div id="panel">
+    <div style="display:flex; gap:8px; flex-wrap:wrap">
+      <button id="btnRun">Run Plan (P)</button>
+      <button id="btnGemini">Run with Gemini</button>
+      <button id="btnShuffle">Shuffle Cups (R)</button>
+      <button id="btnHelp">Help (H)</button>
+    </div>
+    <div style="margin-top:6px; font-size:12px; color:#b9c2d0">
+      Interact: <b>E</b> (grab/place/press) • Move: <b>WASD</b> • Sprint: <b>Shift</b> • Shuffle: <b>R</b>
+    </div>
+    <pre id="log"></pre>
+  </div>
+
+  <div id="help">
+    <b>Pointer Lock</b>: required so mouse can look around. Click the scene or press any Run button—we'll auto-request it. Status: <span id="pl-status">Unlocked</span><br/><br/>
+    <b>Selectors supported</b><br/>
+    <code>#id</code> • <code>role(button)[name="Dispense"]</code> • <code>cup[color=0000ff]</code> • <code>object[name="Blue Cup"]</code><br/><br/>
+    <b>Demo plan</b><br/>
+    1) Go to <code>cup[color=0000ff]</code> → Grab<br/>
+    2) Go to <code>role(button)[name="Dispense"]</code> → Press (fills cup)<br/>
+    3) Go to <code>#table_target</code> → Place<br/><br/>
+    <i>Shuffle cups to prove robustness to reordering.</i>
+  </div>
+
+  <script type="module">
+    // ===== Imports =====
+    import * as THREE from 'three';
+    import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js';
+
+    // ===== Core globals =====
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0d0f14);
+    const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 100);
+    const renderer = new THREE.WebGLRenderer({ antialias:true });
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    // Lights
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x222244, 0.8);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(4, 8, 2);
+    scene.add(dir);
+
+    // Ground + simple room cues
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(30, 30),
+      new THREE.MeshStandardMaterial({ color:0x1a1f2a, roughness:.9, metalness:0 })
+    );
+    ground.rotation.x = -Math.PI/2;
+    ground.receiveShadow = true;
+    ground.userData = { id:'floor', type:'area', role:'region', name:'Floor', attrs:{}, tags:['ground'] };
+    scene.add(ground);
+
+    // Walls (low)
+    const wallMat = new THREE.MeshStandardMaterial({ color:0x151922, roughness:.9 });
+    for (const [x,z,rx,rz,w,h] of [
+      [ 0,-15, 0,0, 30, 2],
+      [ 0, 15, 0,0, 30, 2],
+      [-15,0, 0,Math.PI/2, 30, 2],
+      [ 15,0, 0,Math.PI/2, 30, 2],
+    ]) {
+      const wall = new THREE.Mesh(new THREE.BoxGeometry(w, h, 0.3), wallMat);
+      wall.position.set(x, h/2, z);
+      wall.rotation.y = rz;
+      scene.add(wall);
+    }
+
+    // Camera / controls
+    camera.position.set(0, 1.6, 5);
+    const controls = new PointerLockControls(camera, document.body);
+    scene.add(controls.getObject());
+
+    // HUD + overlay
+    const overlay = document.getElementById('overlay');
+    const plStatusEl = document.getElementById('pl-status');
+    const updatePL = () => { if (plStatusEl) plStatusEl.textContent = controls.isLocked ? 'Locked' : 'Unlocked'; };
+    overlay.addEventListener('click', () => controls.lock());
+    controls.addEventListener('lock', ()=> { overlay.style.display='none'; updatePL(); });
+    controls.addEventListener('unlock', ()=> { overlay.style.display='flex'; updatePL(); });
+    // ===== Pointer lock helper =====
+    async function ensurePointerLock() {
+      if (controls.isLocked) return true;
+      return new Promise((resolve) => {
+        const onLock = () => { controls.removeEventListener('lock', onLock); resolve(true); };
+        controls.addEventListener('lock', onLock);
+        try { controls.lock(); } catch (e) { resolve(false); return; }
+        setTimeout(() => resolve(controls.isLocked), 300);
+      });
+    }
+
+
+    // Movement state
+    const move = { f:0, b:0, l:0, r:0, sprint:0 };
+    const vel = new THREE.Vector3();
+    const dirVec = new THREE.Vector3();
+
+    // Input
+    addEventListener('keydown', e=>{
+      if (e.repeat) return;
+      if (e.code==='KeyW') move.f=1;
+      if (e.code==='KeyS') move.b=1;
+      if (e.code==='KeyA') move.l=1;
+      if (e.code==='KeyD') move.r=1;
+      if (e.code==='ShiftLeft' || e.code==='ShiftRight') move.sprint=1;
+      if (e.code==='KeyE') onInteract();
+      if (e.code==='KeyP') runPlan();
+      if (e.code==='KeyG') runGemini();
+      if (e.code==='KeyR') shuffleCups();
+      if (e.code==='KeyH') toggleHelp();
+    });
+    addEventListener('keyup', e=>{
+      if (e.code==='KeyW') move.f=0;
+      if (e.code==='KeyS') move.b=0;
+      if (e.code==='KeyA') move.l=0;
+      if (e.code==='KeyD') move.r=0;
+      if (e.code==='ShiftLeft' || e.code==='ShiftRight') move.sprint=0;
+    });
+    addEventListener('resize', ()=>{
+      camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // ===== Helpers: logging =====
+    const logEl = document.getElementById('log');
+    function log(s){ logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; console.log('[log]', s); }
+
+    // ===== Semantic selector engine =====
+    function normalizeHex(x){ if(!x) return ''; const s=String(x).replace('#','').toLowerCase(); return s.length===3? s.split('').map(c=>c+c).join('') : s.padStart(6,'0').slice(0,6); }
+    function* traverse(root){ const st=[...root.children]; while(st.length){ const n=st.pop(); if(!n) continue; yield n; if(n.children) st.push(...n.children);} }
+
+    function parseSelector(selector){
+      const idm = selector.match(/^#([\w\-\.:]+)$/);
+      if (idm) return { id:idm[1] };
+      const roleName = selector.match(/^role\(([^)]+)\)\s*\[name="([^"]+)"\]$/);
+      if (roleName) return { role:roleName[1], name:roleName[2] };
+      const m = [...selector.matchAll(/\[([a-zA-Z0-9_:-]+)=["']?([^"'\]]+)["']?\]/g)].map(([,k,v])=>[k,v]);
+      const tag = (selector.match(/^([a-zA-Z0-9_:-]+)/)||[])[1] || null;
+      if (tag || m.length) return { tag, attrs:Object.fromEntries(m) };
+      const tagName = selector.match(/^([a-zA-Z0-9_:-]+)\[name="([^"]+)"\]$/);
+      if (tagName) return { tag:tagName[1], name:tagName[2] };
+      return { raw:selector };
+    }
+
+    function matchesKV(obj, key, val){
+      const ud = obj.userData || {};
+      if (key==='name') return (ud.name || obj.name) === val;
+      if (key==='role') return String(ud.role||'').toLowerCase() === String(val).toLowerCase();
+      const attrs = ud.attrs || {};
+      if (key==='color') return normalizeHex(attrs.color) === normalizeHex(val);
+      return (attrs[key] ?? null) === val;
+    }
+
+    function resolve(selector, { preferNearest=null } = {}){
+      const q = parseSelector(selector);
+      // by id
+      if (q.id) {
+        for (const o of traverse(scene)) {
+          if ((o.userData && o.userData.id===q.id) || o.name===q.id) return o;
+        }
+        return null;
+      }
+      const cands = [];
+      for (const o of traverse(scene)) {
+        const ud = o.userData || {};
+        if (q.role && String(ud.role).toLowerCase() !== String(q.role).toLowerCase()) continue;
+        if (q.tag && String(ud.type||'').toLowerCase() !== String(q.tag).toLowerCase()) continue;
+        if (q.name && (ud.name || o.name) !== q.name) continue;
+        let ok = true;
+        if (q.attrs) for (const [k,v] of Object.entries(q.attrs)) { if (!matchesKV(o,k,v)) { ok=false; break; } }
+        if (ok) cands.push(o);
+      }
+      if (!cands.length) return null;
+      if (preferNearest && cands.length>1) {
+        const o = preferNearest.getWorldPosition(new THREE.Vector3());
+        cands.sort((a,b)=>{
+          const A=a.getWorldPosition(new THREE.Vector3()).distanceToSquared(o);
+          const B=b.getWorldPosition(new THREE.Vector3()).distanceToSquared(o);
+          return A-B;
+        });
+      }
+      return cands[0];
+    }
+
+    // ===== World objects =====
+    const objs = { cups:[], button:null, dispenser:null, table:null };
+    const tmpV = new THREE.Vector3();
+
+    function createCup({ color, name, id }){
+      const cup = new THREE.Group();
+      const body = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.045, 0.05, 0.09, 32, 1, true),
+        new THREE.MeshStandardMaterial({ color, roughness:.4, metalness:.05, side:THREE.DoubleSide })
+      );
+      body.position.y = 0.045;
+      cup.add(body);
+
+      // water (fill visuals)
+      const water = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.044, 0.044, 0.001, 32),
+        new THREE.MeshStandardMaterial({ color:0x1ea7ff, transparent:true, opacity:0.65 })
+      );
+      water.name = 'water';
+      water.position.y = 0.0005;
+      cup.add(water);
+
+      cup.userData = {
+        id, type:'cup', role:'object', name, attrs:{ color: normalizeHex(color) },
+        tags:['cup','pickable'],
+        pickable:true,
+        fillLevel: 0, // 0..1
+        selectors:[ `#${id}`, `cup[color=${normalizeHex(color)}]`, `role(object)[name="${name}"]` ]
+      };
+      cup.name = id;
+      return cup;
+    }
+
+    function createDispenser(){
+      const g = new THREE.Group();
+      const base = new THREE.Mesh(
+        new THREE.BoxGeometry(0.6, 1.2, 0.6),
+        new THREE.MeshStandardMaterial({ color:0x303848, roughness:.7 })
+      );
+      base.position.y = 0.6;
+      g.add(base);
+
+      const spout = new THREE.Mesh(
+        new THREE.BoxGeometry(0.12, 0.06, 0.2),
+        new THREE.MeshStandardMaterial({ color:0x222a36 })
+      );
+      spout.position.set(0, 1.0, 0.35);
+      spout.name = 'spout';
+      g.add(spout);
+
+      const btn = new THREE.Mesh(
+        new THREE.BoxGeometry(0.12, 0.04, 0.12),
+        new THREE.MeshStandardMaterial({ color:0x888888, roughness:.5, metalness:.1 })
+      );
+      btn.position.set(0.18, 1.1, 0.31);
+      btn.userData = { id:'dispenser_button', type:'button', role:'button', name:'Dispense', attrs:{}, pressable:true, selectors:['#dispenser_button','role(button)[name="Dispense"]'] };
+      btn.name = 'dispenser_button';
+      g.add(btn);
+
+      g.userData = { id:'dispenser', type:'appliance', role:'region', name:'Water Dispenser' };
+      return { group:g, button:btn, spout };
+    }
+
+    function createTable(){
+      const t = new THREE.Group();
+      const top = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.06, 0.8), new THREE.MeshStandardMaterial({ color:0x2f3642 }));
+      top.position.y = 0.6; t.add(top);
+      const legMat = new THREE.MeshStandardMaterial({ color:0x242a34 });
+      for (const [x,z] of [[-0.55,-0.35],[0.55,-0.35],[-0.55,0.35],[0.55,0.35]]) {
+        const leg = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.6, 0.06), legMat);
+        leg.position.set(x, 0.3, z); t.add(leg);
+      }
+      t.userData = { id:'table_target', type:'area', role:'region', name:'Target Table', placeTarget:true, selectors:['#table_target'] };
+      t.name = 'table_target';
+      return t;
+    }
+
+    // Place objects
+    (function initWorld(){
+      // Dispenser
+      const { group, button, spout } = createDispenser();
+      group.position.set(-3, 0, -2);
+      scene.add(group);
+      objs.dispenser = group; objs.button = button; objs.spout = spout;
+
+      // Table
+      const table = createTable();
+      table.position.set(3, 0, -2);
+      scene.add(table);
+      objs.table = table;
+
+      // Cups
+      const placements = [ new THREE.Vector3(-1.2,0, 1.4), new THREE.Vector3(0,0, 1.6), new THREE.Vector3(1.2,0, 1.4) ];
+      const specs = [
+        { color:0xff0000, name:'Red Cup', id:'cup_red_1'   },
+        { color:0x00ff00, name:'Green Cup', id:'cup_green_1'},
+        { color:0x0000ff, name:'Blue Cup', id:'cup_blue_1' }
+      ];
+      specs.forEach((s,i)=>{
+        const cup = createCup(s);
+        cup.position.copy(placements[i]); scene.add(cup); objs.cups.push(cup);
+      });
+      log('Scene ready. Press P to run plan, S to shuffle cups.');
+    })();
+
+    // ===== Interaction: pick, grab, press, place =====
+    const raycaster = new THREE.Raycaster();
+    const hand = new THREE.Object3D(); // attach point in front of camera
+    hand.position.set(0.18, -0.1, -0.45);
+    camera.add(hand);
+
+    let held = null; // THREE.Object3D | null
+
+    function pickObject(){
+      const origin = camera.getWorldPosition(new THREE.Vector3());
+      const direction = camera.getWorldDirection(new THREE.Vector3());
+      raycaster.set(origin, direction);
+      // Intersect all descendants; Three sorts nearest-first
+      const hits = raycaster.intersectObjects(scene.children, true);
+      for (const h of hits) {
+        let o = h.object;
+        // Bubble up until we find an interactable ancestor
+        while (o) {
+          const ud = o.userData || {};
+          if (ud.pressable || ud.pickable || ud.placeTarget) return o;
+          o = o.parent;
+        }
+      }
+      return null;
+    }
+
+    function selectorCandidates(obj){
+      const ud = obj?.userData || {};
+      return (ud.selectors || []).concat([
+        ud.id ? `#${ud.id}` : null,
+        (ud.type==='cup' && ud.attrs?.color) ? `cup[color=${ud.attrs.color}]` : null,
+        (ud.role && ud.name) ? `role(${ud.role})[name="${ud.name}"]` : null
+      ]).filter(Boolean);
+    }
+
+    function onInteract(){
+      // If holding something → try place
+      if (held) {
+        const target = pickObject();
+        if (target && (target.userData?.placeTarget || target.userData?.type==='area')) {
+          place(target);
+          return;
+        }
+        // Not over a place target → drop at feet
+        placeAtFeet();
+        return;
+      }
+      // Not holding → check press/grab
+      const obj = pickObject();
+      if (!obj) { log('No interactable under crosshair'); return; }
+      if (obj.userData?.pressable) {
+        press(obj);
+        return;
+      }
+      if (obj.userData?.pickable) {
+        grab(obj);
+        return;
+      }
+    }
+
+    function grab(obj){
+      if (held) return;
+      // Attach to hand with local offset
+      const wp = obj.getWorldPosition(new THREE.Vector3());
+      const wo = new THREE.Quaternion(); obj.getWorldQuaternion(wo);
+      scene.attach(obj); // world to scene
+      hand.add(obj);
+      obj.position.copy(obj.worldToLocal(wp)); // reset but we’ll snap small offset
+      obj.position.set(0,0,0);
+      obj.rotation.set(0,0,0);
+      obj.userData.held = true;
+      held = obj;
+      log(`Grabbed: ${obj.userData?.name || obj.name} | ${selectorCandidates(obj)[0]||''}`);
+    }
+
+    function place(target){
+      if (!held) return;
+      // Place on target top surface
+      const topY = target.getWorldPosition(new THREE.Vector3()).y + 0.64; // table height approx
+      const drop = held;
+      scene.add(drop);
+      drop.position.copy(target.getWorldPosition(new THREE.Vector3()));
+      drop.position.y = topY;
+      drop.position.x += (Math.random()-0.5)*0.2;
+      drop.position.z += (Math.random()-0.5)*0.2;
+      drop.rotation.set(0,0,0);
+      drop.userData.held = false;
+      held = null;
+      log(`Placed on ${target.userData?.name || target.name}`);
+    }
+
+    function placeAtFeet(){
+      if (!held) return;
+      const p = camera.getWorldPosition(new THREE.Vector3());
+      const fwd = camera.getWorldDirection(new THREE.Vector3()).setY(0).normalize();
+      const drop = held;
+      scene.add(drop);
+      drop.position.copy(p).add(fwd.multiplyScalar(0.6));
+      drop.position.y = 0.05;
+      drop.rotation.set(0,0,0);
+      drop.userData.held = false;
+      held = null;
+      log(`Dropped near player`);
+    }
+
+    function press(button){
+      const ud = button.userData || {};
+      log(`Pressed: ${ud.name || button.name}`);
+      // If holding a cup and under the spout, fill it
+      if (held && objs.spout) {
+        const cup = held;
+        const cupPos = cup.getWorldPosition(new THREE.Vector3());
+        const spoutPos = objs.spout.getWorldPosition(new THREE.Vector3());
+        const dist = cupPos.distanceTo(spoutPos.add(new THREE.Vector3(0,-0.12,0)));
+        if (dist < 0.20) {
+          fillCup(cup, 1.0);
+        } else {
+          log('Cup not under spout — hold cup closer to the spout then press.');
+        }
+      }
+      // Visual button nudge
+      button.position.y -= 0.01; setTimeout(()=>button.position.y += 0.01, 120);
+    }
+
+    function fillCup(cup, target=1.0){
+      const water = cup.getObjectByName('water');
+      if (!water) return;
+      const start = cup.userData.fillLevel || 0;
+      const dur = 900;
+      const t0 = performance.now();
+      (function anim(){
+        const t = Math.min(1, (performance.now()-t0)/dur);
+        const lvl = start + (target - start)*t;
+        cup.userData.fillLevel = lvl;
+        water.scale.y = Math.max(0.001, lvl*60);
+        water.position.y = 0.001 + lvl*0.085;
+        if (t<1) requestAnimationFrame(anim); else log(`Cup filled to ${(lvl*100)|0}%`);
+      })();
+    }
+
+    // ===== Movement update =====
+    const clock = new THREE.Clock();
+    function updateMovement(dt){
+      if (!controls.isLocked) return;
+      const speed = (move.sprint ? 3.6 : 2.2);
+
+      // Camera-based forward/right on the XZ plane
+      const forward = camera.getWorldDirection(new THREE.Vector3());
+      forward.y = 0;
+      if (forward.lengthSq() === 0) forward.set(0, 0, -1); else forward.normalize();
+      const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0,1,0)).normalize();
+
+      // Build desired move vector in world space
+      const moveVec = new THREE.Vector3();
+      if (move.f) moveVec.add(forward);
+      if (move.b) moveVec.sub(forward);
+      if (move.r) moveVec.add(right);
+      if (move.l) moveVec.sub(right);
+
+      if (moveVec.lengthSq() > 0) {
+        moveVec.normalize().multiplyScalar(speed * dt);
+        const obj = controls.getObject().position;
+        obj.add(moveVec);
+        // keep on ground plane
+        controls.getObject().position.y = 1.6;
+      }
+    }
+
+    // ===== Plan runner =====
+    const demoPlan = [
+      { action:'goTo', target:'cup[color=0000ff]' },
+      { action:'grab', target:'cup[color=0000ff]' },
+      { action:'goTo', target:'role(button)[name="Dispense"]' },
+      { action:'press', target:'role(button)[name="Dispense"]' },
+      { action:'goTo', target:'#table_target' },
+      { action:'place', target:'#table_target' },
+    ];
+
+    let planQueue = [];
+    let navTarget = null;
+
+    // ===== Agent adapter: Gemini live control =====
+    const Tools = {
+      async goTo({ target }) {
+        const obj = resolve(target, { preferNearest: camera });
+        if (!obj) { log(`[Agent] goTo: target not found ${target}`); return { ok:false, error:'target_not_found' }; }
+        startGoTo(obj);
+        return { ok:true };
+      },
+      async grab({ target }) {
+        const obj = resolve(target, { preferNearest: camera });
+        if (!obj) return { ok:false, error:'target_not_found' };
+        if (!held) grab(obj);
+        return { ok:true };
+      },
+      async press({ target }) {
+        const obj = resolve(target, { preferNearest: camera });
+        if (!obj) return { ok:false, error:'target_not_found' };
+        press(obj);
+        return { ok:true };
+      },
+      async place({ target }) {
+        const obj = resolve(target, { preferNearest: camera });
+        if (held) {
+          if (obj) place(obj); else placeAtFeet();
+          return { ok:true };
+        }
+        return { ok:false, error:'nothing_held' };
+      },
+      say({ text }) { log(`[Agent] ${text}`); return { ok:true }; },
+    };
+
+    function snapshot() {
+      return {
+        you: {
+          pos: controls.getObject().position.toArray(),
+          holding: held?.userData?.id || null,
+        },
+        objects: [...traverse(scene)].slice(0, 200).map(o => ({
+          id: o.userData?.id || o.name || null,
+          type: o.userData?.type || null,
+          role: o.userData?.role || null,
+          name: o.userData?.name || null,
+          attrs: o.userData?.attrs || {},
+          selectors: selectorCandidates(o) || [],
+        })),
+      };
+    }
+
+    function extractToolCall(resp) {
+      try {
+        if (!resp) return null;
+        // Gemini typical: candidates[0].content.parts[].functionCall
+        const cand = (resp.candidates && resp.candidates[0]) || null;
+        const parts = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : null;
+        if (parts) {
+          const p = parts.find(x => x.functionCall);
+          if (p && p.functionCall) {
+            const { name, args } = p.functionCall;
+            return { name, args: args || {} };
+          }
+        }
+        // Fallbacks for other shapes
+        if (resp.functionCall) return { name: resp.functionCall.name, args: resp.functionCall.args || {} };
+        const tc = resp.toolCall || (Array.isArray(resp.tool_calls) ? resp.tool_calls[0] : null);
+        if (tc && tc.name) return { name: tc.name, args: tc.args || {} };
+        return null;
+      } catch (e) {
+        console.warn('extractToolCall error', e, resp);
+        return null;
+      }
+    }
+
+    async function agentStep(goal) {
+      const observation = snapshot();
+      let resp;
+      try {
+        resp = await fetch('http://localhost:8787/agent/step', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ observation, goal }),
+        }).then(r => r.json());
+      } catch (err) {
+        log('[Agent] server not reachable at http://localhost:8787/agent/step');
+        return false;
+      }
+      const call = extractToolCall(resp);
+      if (!call) { log('[Agent] (no tool call)'); return false; }
+      const fn = Tools[call.name];
+      if (!fn) { log(`[Agent] unknown tool ${call.name}`); return false; }
+      const result = await fn(call.args || {});
+      log(`[Agent] ${call.name}(${JSON.stringify(call.args || {})}) -> ${result.ok ? 'ok' : 'fail'}`);
+      return true;
+    }
+
+    async function runGemini() {
+      if (!controls.isLocked) {
+        log('Requesting pointer lock…');
+        const ok = await ensurePointerLock();
+        if (!ok) { log('Pointer lock denied. Click the scene and try again.'); return; }
+      }
+      const goal = 'Fetch a cup of water and place it on the target table.';
+      log('[Agent] starting…');
+      for (let i = 0; i < 24; i++) {
+        const ok = await agentStep(goal);
+        await new Promise(r => setTimeout(r, 200));
+        if (!ok) break;
+      }
+      log('[Agent] done.');
+    }
+
+    async function runPlan(plan = demoPlan){
+      if (!controls.isLocked) {
+        log('Requesting pointer lock…');
+        const ok = await ensurePointerLock();
+        if (!ok) { log('Pointer lock denied. Click the scene and try again.'); return; }
+      }
+      planQueue = plan.slice();
+      log('Running plan…');
+    }
+
+    function startGoTo(obj){
+      if (!obj) { log('goTo: target not found'); return; }
+      navTarget = obj;
+    }
+
+    function stepPlan(dt){
+      if (!planQueue.length) return;
+      const step = planQueue[0];
+
+      if (step.action === 'goTo') {
+        if (!navTarget) startGoTo(resolve(step.target, { preferNearest: camera }) );
+        if (!navTarget) { planQueue.shift(); return; }
+        // Move player toward target (simple straight-line)
+        const player = controls.getObject().position;
+        const target = navTarget.getWorldPosition(new THREE.Vector3());
+        const to = target.clone().sub(player); to.y = 0;
+        const dist = to.length();
+        const moveStep = Math.min(dist, 2.8*dt);
+        if (dist > 0.2) {
+          to.normalize().multiplyScalar(moveStep);
+          player.add(to);
+        } else {
+          navTarget = null;
+          log(`Arrived at ${step.target}`);
+          planQueue.shift();
+        }
+        return;
+      }
+
+      if (step.action === 'grab') {
+        const o = resolve(step.target, { preferNearest: camera });
+        if (o && !held) { grab(o); planQueue.shift(); }
+        else planQueue.shift(); // skip if not found
+        return;
+      }
+
+      if (step.action === 'press') {
+        const o = resolve(step.target, { preferNearest: camera });
+        if (o) press(o);
+        planQueue.shift();
+        return;
+      }
+
+      if (step.action === 'place') {
+        const o = resolve(step.target, { preferNearest: camera });
+        if (o) place(o); else placeAtFeet();
+        planQueue.shift();
+        return;
+      }
+
+      // Unknown action → skip
+      planQueue.shift();
+    }
+
+    // ===== Shuffle cups (robustness test) =====
+    function shuffleCups(){
+      const spots = [
+        new THREE.Vector3(-1.0,0, 0.8),
+        new THREE.Vector3( 0.0,0, 1.6),
+        new THREE.Vector3( 1.2,0, 0.9),
+        new THREE.Vector3(-0.6,0, 1.2),
+        new THREE.Vector3( 0.8,0, 1.3),
+      ];
+      for (const cup of objs.cups) {
+        const p = spots.splice(Math.floor(Math.random()*spots.length),1)[0];
+        cup.position.copy(p);
+      }
+      log('Shuffled cups.');
+    }
+
+    // ===== Toggle help
+    function toggleHelp(){
+      const el = document.getElementById('help');
+      el.style.display = (el.style.display==='none'||!el.style.display)? 'block' : 'none';
+    }
+    document.getElementById('btnRun').onclick = ()=> runPlan();
+    document.getElementById('btnGemini').onclick = ()=> runGemini();
+    document.getElementById('btnShuffle').onclick = ()=> shuffleCups();
+    document.getElementById('btnHelp').onclick = ()=> toggleHelp();
+
+    // ===== Main loop =====
+    function animate(){
+      requestAnimationFrame(animate);
+      const dt = Math.min(0.033, clock.getDelta());
+      updateMovement(dt);
+      stepPlan(dt);
+      renderer.render(scene, camera);
+    }
+    animate();
+  </script>
+</body>
+</html>

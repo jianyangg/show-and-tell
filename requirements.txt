@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+playwright
+google-genai
+openai>=1.6.0
+httpx
+websockets
+mcp
+elevenlabs
+pyaudio>=0.2.14
+ssl

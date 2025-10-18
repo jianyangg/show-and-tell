@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import logging
+from operator import call
 import os
 import re
 import time
@@ -223,9 +224,7 @@ class TeachSession:
             "extra": extra or {},
         }
 
-    def record_mouse_move(
-        self, x: float, y: float, threshold: float = 5.0
-    ) -> None:
+    def record_mouse_move(self, x: float, y: float, threshold: float = 5.0) -> None:
         """
         Record mouse movement. If mouse is down, mark as potentially dragging.
 
