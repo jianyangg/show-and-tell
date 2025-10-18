@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/jianyang/Documents/**)",
+      "Bash(find /Users/jianyang/Documents/Documents - Jian Yang''s MacBook Pro/show-and-tell -maxdepth 2 -type f ( -name \"package.json\" -o -name \"setup.py\" -o -name \"pyproject.toml\" -o -name \"README.md\" ))"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

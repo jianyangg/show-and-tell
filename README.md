@@ -1,133 +1,422 @@
-# Cursor Hackathon Runner
+# Show and Tell
 
-This repo contains the bootstrap slice of the Gemini Computer Use runner described in `PLAN.md`. It spins up a FastAPI backend that launches a headless Chromium session via Playwright, executes a simple plan, and streams viewport frames plus run events over WebSockets. A minimal HTML frontend renders the screencast for manual verification.
+A multi-modal AI automation framework combining trainable computer use, AI debate system, and Model Context Protocol integration.
 
-## Getting Started
+## Features
 
-- Python 3.11+
-- Node (optional) if you want to use `npx wscat` for the run-event stream
-- Playwright Chromium binaries (`python -m playwright install chromium`)
-- Gemini access (`GEMINI_API_KEY` environment variable) if you want to turn on the Computer Use agent
+### 1. Trainable Computer Use
+Teach AI by speaking and demonstrating - narrate instructions while performing browser actions, then synthesize your demonstrations into executable automation plans.
 
-### Install dependencies
+- **Teach**: Speak and narrate your intentions while demonstrating browser actions (clicks, typing, navigation)
+- **Capture**: Records your voice instructions, screen actions, and audio transcription in real-time
+- **Synthesize**: AI converts your multimodal demonstration into reusable, parameterizable plans using GPT-5
+- **Execute**: Run synthesized plans with Gemini Computer Use for intelligent browser automation
+- **Stream**: Real-time WebSocket updates with live viewport rendering
+
+### 2. AI Debate/Chat System
+Watch two Gemini AI models debate topics with animated avatars and text-to-speech.
+
+- Dual Gemini models debating with full context tracking
+- Live2D animated character models (Obama and Trump personas)
+- ElevenLabs text-to-speech integration
+- Real-time WebSocket streaming to browser
+- Dynamic South Park-style background generation
+
+### 3. MCP Server Integration
+Model Context Protocol bridge exposing automation capabilities to Claude, Codex, and other AI tools.
+
+- List and inspect synthesized plans
+- Trigger plan synthesis from recordings
+- Execute and monitor automation runs
+- Capture screenshots and artifacts
+- Event streaming for real-time updates
+
+## Technology Stack
+
+**Backend (Python):**
+- FastAPI + Uvicorn (async HTTP & WebSocket server)
+- Playwright (headless browser automation)
+- OpenAI GPT-5 (plan synthesis from multimodal demonstrations)
+- Google Gemini APIs (Computer Use for execution)
+- Pydantic (data validation)
+- SQLite (recording & plan storage)
+- ElevenLabs TTS (text-to-speech)
+- MCP SDK (Model Context Protocol)
+
+**Frontend (TypeScript/React):**
+- React 18.3 with Vite
+- Material-UI (MUI)
+- Zustand (state management)
+- WebSocket client for real-time updates
+
+**Chat/Visualization:**
+- PIXI.js (2D WebGL renderer for animated sprites)
+- WebSockets for real-time streaming
+- Live2D models for character animation
+
+## Prerequisites
+
+- Python 3.12+
+- Node.js 18+ and Yarn
+- Chromium (installed via Playwright)
+- API Keys:
+  - `GEMINI_API_KEY` - Google Gemini API
+  - `ELEVENLABS_API_KEY` - ElevenLabs TTS
+  - `OPENAI_API_KEY` - OpenAI (optional)
+
+## Installation
+
+### 1. Set up Python virtual environment
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r backend/requirements.txt
+# Create and activate virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Install Playwright browser
 python -m playwright install chromium
 ```
 
-### Run the backend
+### 2. Set up Frontend dependencies
 
 ```bash
-uvicorn backend.app.api:app --reload
+cd frontend
+yarn install
+cd ..
 ```
 
-### Launch from the browser UI
+### 3. Set up Chat dependencies
 
-Open `frontend/index.html`, point the **API Base** field at your FastAPI server, and follow the four-button loop:
-
-1. **Start Record** – capture a teaching session (tab or cropped region).
-2. **Stop Record** – upload the captured keyframes and markers to the backend.
-3. **Synthesize Steps** – ask Gemini 2.5 Pro to convert the bundle into a plan.
-4. **Run Steps** – execute the synthesized plan with Gemini Computer Use and watch the viewport render inside the canvas.
-
-The console beneath the viewport shows the prompts/responses exchanged with Gemini 2.5 Pro and Gemini Computer Use so you can audit every turn.
-
-While a run is active, any returned `safety_prompt` events display an allow/deny overlay. Declining halts the run immediately.
-
-See `USER_MANUAL.md` for step-by-step instructions and troubleshooting tips.
-
-### One-command demo helper
-
-Use `scripts/run_demo.sh` to boot the backend and install dependencies inside `.venv`. The script leaves uvicorn running until you press `Ctrl+C`; perform the Record → Synthesize → Run loop from the browser.
-
-### Enable Gemini Computer Use (optional)
-
-Set your API key and flip on the agent flag before starting the server:
+The `chat` directory contains both frontend (HTML/JS) and backend (Python) components. This is a hackathon-style setup - not the cleanest architecture but functional.
 
 ```bash
-export GEMINI_API_KEY=...  # already present in your shell rc
-export COMPUTER_USE_ENABLED=1
-uvicorn backend.app.api:app --reload
+# Dependencies are already included in the root requirements.txt
+# No additional setup needed
 ```
 
-When enabled, each turn sends a screenshot + goal context to Gemini 2.5 Computer Use, and the returned tool calls are executed via Playwright. The `actions_applied` events include the Computer Use function metadata so you can inspect what the model attempted.
+### 4. Configure environment variables
 
-## Current Scope
+Create a `.env` file in the root directory:
 
-- Runs are plan-driven only; free-form goal execution has been removed.
-- Recording bundles, plans, and runs are kept in-memory for fast iteration.
-- Gemini 2.5 Pro powers plan synthesis, and Gemini Computer Use handles execution with a fixed 1440×900 viewport.
-- `/runs/{id}/abort` signals the runner and short-circuits the current Playwright turn.
+```bash
+# Required (I should have cleaned these up further)
+GEMINI_API_KEY=your_gemini_api_key_here
+ELEVENLABS_API_KEY=your_elevenlabs_api_key_here
+OPENAI_API_KEY=your_openai_api_key_here
+COMPUTER_USE_ENABLED=1
+PLAN_SYNTH_ENABLED=1
+ENABLE_TRANSCRIPTION=1
 
-See `NOTES.md` for a short status log and `RUN_LOOP.md` for details on the execution APIs.
+# Optional
+RUNNER_VIEWPORT_WIDTH=1440
+RUNNER_VIEWPORT_HEIGHT=900
+```
 
-## MCP Provider Quick Start
+## Running the Application
 
-The repository now ships with an MCP-compatible server that exposes the runner APIs to Codex, Claude, Gemini, and other MCP-
-aware clients.
+### Quick Start (All Services)
 
-### Prerequisites
+Use the provided shell script to run all services in parallel:
 
-- Activate the project virtual environment (`python -m venv .venv && source .venv/bin/activate`).
-- Install backend + MCP dependencies (including the official `mcp` Python SDK): `pip install -r backend/requirements.txt`.
-- Launch the runner API: `scripts/run_demo.sh` or `uvicorn backend.app.api:app --reload`.
+```bash
+chmod +x run_all.sh
+./run_all.sh
+```
+
+This will start:
+- Backend API on `http://localhost:8000`
+- Frontend on `http://localhost:5173`
+- Debate server on WebSocket `localhost:8765`
+- Chat frontend on `http://localhost:9000`
+
+### Manual Start (Individual Services)
+
+If you prefer to run services individually in separate terminals:
+
+#### Terminal 1: Backend API
+```bash
+source venv/bin/activate
+cd backend
+uvicorn app.api:app --reload
+```
+
+#### Terminal 2: Frontend
+```bash
+cd frontend
+yarn dev
+```
+
+#### Terminal 3: Debate Server
+```bash
+source venv/bin/activate
+cd chat
+python debate_server.py
+```
+
+#### Terminal 4: Chat Frontend
+```bash
+cd chat
+python -m http.server 9000
+```
+
+## Accessing the Application
+
+Once all services are running:
+
+- **Computer Use Frontend**: http://localhost:5173
+  - Teach by speaking and demonstrating browser actions
+  - Synthesize multimodal demonstrations into automation plans
+  - Execute automated workflows with variable inputs
+
+- **AI Debate Chat**: http://localhost:9000
+  - Enter debate topics
+  - Watch AI models debate with animations
+  - View real-time transcripts
+
+## MCP Server Setup
+
+The MCP server exposes automation capabilities to Claude and other AI tools via the Model Context Protocol.
 
 ### Configuration
 
-The server reads configuration from environment variables:
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `RUNNER_BASE_URL` | Base URL for the FastAPI runner | `http://127.0.0.1:8000` |
-| `RUNNER_API_KEY` / `RUNNER_API_KEY_PATH` | Inline token or path to a JSON/text file containing the bearer token | unset |
-| `RUNNER_REPORT_DIR` | Root directory for run reports | `./reports` |
-| `RUNNER_SCREENSHOT_DIR` | Screenshot output directory | `./reports` |
-
-### Launch the MCP server
-
-```bash
-python -m mcp_server.main --log-level INFO
-```
-
-The process listens on stdio, so you can wire it into any MCP client configuration. Example snippet for Codex or Claude:
+Add to your Claude Desktop config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
 
 ```json
 {
-  "type": "stdio",
-  "command": "python",
-  "args": ["-m", "mcp_server.main"],
-  "env": {
-    "RUNNER_BASE_URL": "http://127.0.0.1:8000"
+  "mcpServers": {
+    "runner-mcp": {
+      "command": "/path/to/your/show-and-tell/venv/bin/python",
+      "args": ["-m", "mcp_server"],
+      "cwd": "/path/to/your/show-and-tell",
+      "env": {
+        "RUNNER_BASE_URL": "http://127.0.0.1:8000",
+        "PYTHONPATH": "/path/to/your/show-and-tell"
+      }
+    }
   }
 }
 ```
 
-### Available tools
+**Important**: Replace `/path/to/your/show-and-tell` with your actual project path.
 
-Once connected, the MCP client can discover and call the following tools:
+### Example Configuration
 
-- `list_plans(recording_id?)` – enumerate synthesized plans.
-- `get_plan_details(plan_id)` / `save_plan(plan_id, name, plan)` – inspect or update a plan.
-- `list_recordings()` / `get_recording_bundle(recording_id)` – explore captured recordings.
-- `synthesize_plan(recording_id, prompt, plan_name?)` – trigger plan synthesis with optional variable hints.
-- `start_run(plan_id, variables?)` and `abort_run(run_id)` – manage automation runs.
-- `capture_screenshot(run_id, label?)` – request a screenshot artifact (stored under `RUNNER_SCREENSHOT_DIR/<run-id>/`).
+For reference, here's a complete example:
 
-Streaming sources expose the live `/ws/runs/{run_id}` and `/ws/teach/{teach_id}` event feeds; MCP clients can subscribe to the
-`run_events` and `teach_events` streams to mirror the browser UI updates.
-
-### Sample invocation
-
-```
-> list_plans
-{}
-
-> start_run
-{"plan_id": "abc123", "variables": {"product_name": "sparkling water"}}
+```json
+{
+  "mcpServers": {
+    "runner-mcp": {
+      "command": "/Users/jianyang/Documents/Documents - Jian Yang's MacBook Pro/cursor-hackathon/.venv/bin/python3.12",
+      "args": ["-m", "mcp_server"],
+      "cwd": "/Users/jianyang/Documents/Documents - Jian Yang's MacBook Pro/cursor-hackathon",
+      "env": {
+        "RUNNER_BASE_URL": "http://127.0.0.1:8000",
+        "PYTHONPATH": "/Users/jianyang/Documents/Documents - Jian Yang's MacBook Pro/cursor-hackathon"
+      }
+    }
+  }
+}
 ```
 
-When `start_run` succeeds, watch the frontend canvas update in real time and inspect the streamed run events from the `run_events`
-subscription.
+### Available MCP Tools
+
+Once configured, Claude can use these tools:
+
+- `list_plans()` - List all synthesized automation plans
+- `get_plan_details(plan_id)` - Inspect plan structure and variables
+- `save_plan(plan)` - Create or update plans
+- `list_recordings()` - Browse captured teaching sessions
+- `synthesize_plan(recording_id, prompt)` - Generate plans from recordings
+- `start_run(plan_id, variables)` - Execute automation
+- `abort_run(run_id)` - Stop running automation
+- `capture_screenshot()` - Get current viewport screenshot
+
+## Project Structure
+
+```
+show-and-tell/
+├── backend/              # FastAPI backend
+│   ├── app/
+│   │   ├── api.py       # Main API endpoints & WebSocket
+│   │   ├── runner.py    # Automation execution engine
+│   │   ├── synthesis.py # Plan synthesis from recordings
+│   │   ├── storage.py   # SQLite storage layer
+│   │   └── schemas.py   # Pydantic models
+│   └── tests/
+├── frontend/             # React TypeScript frontend
+│   ├── src/             # Computer Use UI components
+│   └── package.json
+├── chat/                 # AI Debate system (frontend + backend)
+│   ├── debate_server.py # WebSocket server for debates
+│   ├── tts.py           # ElevenLabs TTS integration
+│   ├── index.html       # Chat UI
+│   ├── main.js          # PIXI.js sprite rendering
+│   ├── runtime/         # Live2D character models
+│   └── assets/          # Character sprites and backgrounds
+├── mcp_server/           # Model Context Protocol bridge
+│   ├── main.py          # MCP server entrypoint
+│   ├── tools.py         # Tool definitions
+│   └── runner_client.py # Backend API client
+├── requirements.txt      # Python dependencies
+├── run_all.sh           # Start all services script
+└── README.md
+```
+
+## Key Workflows
+
+### 1. Teaching/Recording
+
+1. Start teaching session via frontend or API (`/teach/start`)
+2. **Speak and narrate** your instructions while performing browser actions
+   - Tell the AI what you're doing and why ("I'm clicking login because...")
+   - Explain your intentions as you click, type, and navigate
+   - Your voice provides context that pure actions cannot capture
+3. System captures multimodal data:
+   - **Audio**: Your voice narration and instructions
+   - **Screen**: Screenshots at regular intervals (1 FPS default)
+   - **Actions**: Clicks, typing, navigation events with timestamps
+   - **Transcription**: Speech-to-text with word-level timestamps
+4. Stop teaching session (`/teach/stop`)
+5. Complete recording bundle (frames + events + audio + transcription) saved to SQLite database
+
+### 2. Plan Synthesis
+1. Select a recording
+2. Provide optional prompt hints
+3. GPT-5 converts multimodal demonstration (voice + actions + visuals) into structured plan
+4. Variables extracted and normalized
+5. Plan stored with metadata and visual checkpoints
+
+### 3. Plan Execution
+1. Select plan and provide variable values
+2. Playwright browser launches (1440x900 viewport)
+3. For each step:
+   - Screenshot sent to Gemini Computer Use
+   - AI returns tool calls (click, fill, navigate)
+   - Actions executed via Playwright
+   - Validation against assertions
+4. Real-time streaming to WebSocket clients
+5. Support for safety prompts and abort
+
+### 4. AI Debate
+1. Enter debate topic
+2. Background image generated
+3. Two Gemini models alternate turns
+4. Text-to-speech via ElevenLabs
+5. PIXI.js renders animated sprites
+6. Real-time transcript display
+
+## Development
+
+### Backend Development
+
+```bash
+source venv/bin/activate
+cd backend
+
+# Run with auto-reload
+uvicorn app.api:app --reload --log-level debug
+
+# Run tests
+pytest tests/
+```
+
+### Frontend Development
+
+```bash
+cd frontend
+
+# Development server with hot reload
+yarn dev
+
+# Build for production
+yarn build
+
+# Preview production build
+yarn preview
+```
+
+### Chat Development
+
+```bash
+source venv/bin/activate
+cd chat
+
+# Run debate server with debug logging
+python debate_server.py
+
+# Serve frontend
+python -m http.server 9000
+```
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `GEMINI_API_KEY` | Google Gemini API key | Required |
+| `ELEVENLABS_API_KEY` | ElevenLabs TTS API key | Required |
+| `OPENAI_API_KEY` | OpenAI API key (optional) | Required |
+| `COMPUTER_USE_ENABLED` | Enable/disable Computer Use | `1` |
+| `RUNNER_VIEWPORT_WIDTH` | Browser viewport width | `1440` |
+| `RUNNER_VIEWPORT_HEIGHT` | Browser viewport height | `900` |
+| `RUNNER_MAX_TURNS` | Max AI turns per step | `4` |
+| `TEACH_FRAME_INTERVAL_SECONDS` | Recording frame rate | `1.0` |
+| `RUNNER_CHECKPOINT_THRESHOLD` | Visual similarity threshold | `0.88` |
+
+## API Documentation
+
+Once the backend is running, visit:
+- Swagger UI: http://localhost:8000/docs
+- ReDoc: http://localhost:8000/redoc
+
+## Troubleshooting
+
+### Playwright Browser Issues
+```bash
+# Reinstall browser
+python -m playwright install chromium
+
+# Check browser installation
+python -m playwright install --help
+```
+
+### Port Conflicts
+If ports are already in use, modify:
+- Backend: Change port in `uvicorn` command
+- Frontend: Update `vite.config.ts`
+- Chat: Change port in `python -m http.server` command
+- Update `RUNNER_BASE_URL` in MCP config accordingly
+
+### WebSocket Connection Issues
+Ensure all services are running and check:
+- Backend WebSocket: `ws://localhost:8000/teach/ws/{teach_id}`
+- Debate WebSocket: `ws://localhost:8765`
+- Frontend WebSocket client configuration
+
+### Missing Dependencies
+```bash
+# Reinstall Python dependencies
+pip install -r requirements.txt --force-reinstall
+
+# Reinstall Node dependencies
+cd frontend && yarn install --force
+```
+
+## License
+
+[Your License Here]
+
+## Contributors
+
+David Wu Xingyu
+Lim Jian Yang
+
+## Acknowledgments
+
+- Google Gemini for AI capabilities
+- Anthropic Claude for MCP integration
+- ElevenLabs for text-to-speech
+- Playwright for browser automation
