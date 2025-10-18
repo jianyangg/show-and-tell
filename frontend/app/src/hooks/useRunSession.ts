@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { RecordingMarker, useAppStore } from '../store/appStore';
 import { buildEventEntries, RawEvent } from '../utils/events';
+import { normalizeStartUrl } from '../utils/startUrl';
 
 function buildRunWsUrl(apiBase: string, runId: string): string {
   const url = new URL(apiBase);
@@ -8,15 +9,6 @@ function buildRunWsUrl(apiBase: string, runId: string): string {
   url.pathname = url.pathname.replace(/\/$/, '') + `/ws/runs/${encodeURIComponent(runId)}`;
   url.search = '';
   return url.toString();
-}
-
-function normalizeStartUrl(rawUrl: string): string | null {
-  const trimmed = rawUrl.trim();
-  if (!trimmed) return null;
-  if (/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(trimmed)) {
-    return trimmed;
-  }
-  return `http://${trimmed}`;
 }
 
 export function useRunSession() {
@@ -34,6 +26,8 @@ export function useRunSession() {
     setCurrentFrame,
     setEventEntries,
     setMarkers,
+    setVariableRequest,
+    applyPlanVariables,
   } = useAppStore((state) => ({
     apiBase: state.apiBase,
     startUrl: state.startUrl,
@@ -46,6 +40,8 @@ export function useRunSession() {
     setCurrentFrame: state.setCurrentFrame,
     setEventEntries: state.setEventEntries,
     setMarkers: state.setMarkers,
+    setVariableRequest: state.setVariableRequest,
+    applyPlanVariables: state.applyPlanVariables,
   }));
 
   const closeRunSocket = useCallback(() => {
@@ -54,7 +50,8 @@ export function useRunSession() {
       socket.close();
       runSocketRef.current = null;
     }
-  }, []);
+    setVariableRequest(null);
+  }, [setVariableRequest]);
 
   const handleRunMessage = useCallback(
     (message: any) => {
@@ -71,6 +68,7 @@ export function useRunSession() {
           addConsoleEntry('Runner', detail ? `${label}: ${detail}` : label);
           if (['failed', 'aborted', 'completed'].includes(label)) {
             setPrompt(null);
+            setVariableRequest(null);
           }
           break;
         }
@@ -89,6 +87,7 @@ export function useRunSession() {
         case 'run_completed':
           setStatus(message.ok ? 'Run completed successfully.' : 'Run finished.');
           setPrompt(null);
+          setVariableRequest(null);
           addConsoleEntry('Runner', message.ok ? 'Run completed successfully.' : 'Run finished.');
           break;
         case 'safety_prompt': {
@@ -102,6 +101,43 @@ export function useRunSession() {
             payload
           );
           addConsoleEntry('Runner', 'Safety confirmation required.');
+          break;
+        }
+        case 'variable_prompt': {
+          const payload = message.payload || {};
+          const vars = Array.isArray(payload?.vars) ? payload.vars : [];
+          const fields = vars
+            .map((entry: any) => {
+              const name = typeof entry?.name === 'string' ? entry.name.trim() : '';
+              if (!name) {
+                return null;
+              }
+              const value =
+                entry?.value === null || entry?.value === undefined ? '' : String(entry.value);
+              return { name, value };
+            })
+            .filter(Boolean) as { name: string; value: string }[];
+          if (fields.length) {
+            setVariableRequest({ fields });
+            setPrompt(null);
+            setStatus('Awaiting variable inputs…');
+            addConsoleEntry('Runner', 'Awaiting operator-provided variables.');
+          } else {
+            addConsoleEntry('Runner', 'Variable prompt received without any fields.');
+          }
+          break;
+        }
+        case 'variables_applied': {
+          const applied = (message.vars || {}) as Record<string, string | number>;
+          setVariableRequest(null);
+          applyPlanVariables(applied);
+          const parts = Object.entries(applied).map(
+            ([name, value]) => `${name}=${String(value ?? '')}`
+          );
+          addConsoleEntry(
+            'Runner',
+            parts.length ? `Variables applied: ${parts.join(', ')}` : 'Variables applied.'
+          );
           break;
         }
         case 'console': {
@@ -120,7 +156,17 @@ export function useRunSession() {
           break;
       }
     },
-    [addConsoleEntry, setCurrentFrame, setEventEntries, setMarkers, setPrompt, setRunStepState, setStatus]
+    [
+      addConsoleEntry,
+      applyPlanVariables,
+      setCurrentFrame,
+      setEventEntries,
+      setMarkers,
+      setPrompt,
+      setRunStepState,
+      setStatus,
+      setVariableRequest,
+    ]
   );
 
   const connectToRun = useCallback(
@@ -149,14 +195,24 @@ export function useRunSession() {
         addConsoleEntry('Runner', 'Connection closed.');
         runSocketRef.current = null;
         setPrompt(null);
+        setVariableRequest(null);
       });
 
       socket.addEventListener('error', () => {
         setStatus('Run connection error.');
         addConsoleEntry('Runner', 'Connection error.');
+        setVariableRequest(null);
       });
     },
-    [addConsoleEntry, apiBase, closeRunSocket, handleRunMessage, setPrompt, setStatus]
+    [
+      addConsoleEntry,
+      apiBase,
+      closeRunSocket,
+      handleRunMessage,
+      setPrompt,
+      setStatus,
+      setVariableRequest,
+    ]
   );
 
   const startRun = useCallback(async () => {
@@ -165,16 +221,37 @@ export function useRunSession() {
       return;
     }
     setPrompt(null);
+    setVariableRequest(null);
     if (planDetail.plan?.steps) {
       planDetail.plan.steps.forEach((step) => setRunStepState(step.id, 'idle'));
     }
     addConsoleEntry('Runner', `Launching plan ${planDetail.planId}`);
     setStatus('Starting run…');
     try {
-      const payload = {
+      const preparedVars: Record<string, string | number> = {};
+      const planVars = planDetail.plan?.vars ?? {};
+      Object.entries(planVars).forEach(([name, rawValue]) => {
+        if (!name) return;
+        if (rawValue === null || rawValue === undefined) {
+          return;
+        }
+        if (typeof rawValue === 'string') {
+          const trimmed = rawValue.trim();
+          if (!trimmed) {
+            return;
+          }
+          preparedVars[name] = trimmed;
+          return;
+        }
+        preparedVars[name] = rawValue;
+      });
+      const payload: Record<string, unknown> = {
         planId: planDetail.planId,
         startUrl: normalizeStartUrl(startUrl),
       };
+      if (Object.keys(preparedVars).length > 0) {
+        payload.variables = preparedVars;
+      }
       const response = await fetch(`${apiBase.replace(/\/$/, '')}/runs/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -204,6 +281,7 @@ export function useRunSession() {
     setRunId,
     setRunStepState,
     setStatus,
+    setVariableRequest,
     startUrl,
   ]);
 
@@ -218,6 +296,33 @@ export function useRunSession() {
     [setPrompt]
   );
 
+  const submitVariables = useCallback(
+    (values: Record<string, string>) => {
+      const socket = runSocketRef.current;
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'submit_variables', values }));
+        addConsoleEntry('Runner', 'Submitted variable values.');
+        setStatus('Variables submitted. Resuming run…');
+      } else {
+        addConsoleEntry('Runner', 'Unable to submit variables: no active run connection.');
+        setStatus('Unable to submit variables (no active run).');
+      }
+      setVariableRequest(null);
+    },
+    [addConsoleEntry, setStatus, setVariableRequest]
+  );
+
+  const abortVariables = useCallback(() => {
+    const socket = runSocketRef.current;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'abort' }));
+    }
+    addConsoleEntry('Runner', 'Abort requested while waiting for variables.');
+    setStatus('Abort requested.');
+    setVariableRequest(null);
+    setPrompt(null);
+  }, [addConsoleEntry, setPrompt, setStatus, setVariableRequest]);
+
   useEffect(() => {
     return () => {
       closeRunSocket();
@@ -228,7 +333,9 @@ export function useRunSession() {
     () => ({
       startRun,
       confirmPrompt,
+      submitVariables,
+      abortVariables,
     }),
-    [confirmPrompt, startRun]
+    [abortVariables, confirmPrompt, startRun, submitVariables]
   );
 }

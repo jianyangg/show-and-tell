@@ -3,6 +3,7 @@ import { ThemeProvider, createTheme, CssBaseline, Container, Stack, Box } from '
 import { HeaderControls } from './components/HeaderControls';
 import { ViewerSection } from './components/ViewerSection';
 import { TimelinePanel } from './components/TimelinePanel';
+import { VariableHintsPanel } from './components/VariableHintsPanel';
 import { PlanPanel } from './components/PlanPanel';
 import { useTeachSession } from './hooks/useTeachSession';
 import { useRunSession } from './hooks/useRunSession';
@@ -42,8 +43,16 @@ const theme = createTheme({
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const { startTeach, stopTeach, isRecording } = useTeachSession(canvasRef);
-  const { startRun, confirmPrompt } = useRunSession();
-  const { synthesizePlan, savePlan, planDetail, providerLabel } = usePlanActions();
+  const { startRun, confirmPrompt, submitVariables, abortVariables } = useRunSession();
+  const {
+    synthesizePlan,
+    savePlan,
+    planDetail,
+    providerLabel,
+    planSummaries,
+    refreshPlans,
+    loadPlan,
+  } = usePlanActions();
 
   const status = useAppStore((state) => state.status);
   const consoleEntries = useAppStore((state) => state.consoleEntries);
@@ -55,9 +64,17 @@ export default function App() {
   const runStepStatus = useAppStore((state) => state.runStepStatus);
   const latestRecording = useAppStore((state) => state.latestRecording);
   const setCurrentFrame = useAppStore((state) => state.setCurrentFrame);
+  const variableRequest = useAppStore((state) => state.variableRequest);
+  const variableHints = useAppStore((state) => state.variableHints);
+  const setVariableHints = useAppStore((state) => state.setVariableHints);
+  const applyPlanVariables = useAppStore((state) => state.applyPlanVariables);
 
   const hasRecording = useMemo(() => Boolean(latestRecording), [latestRecording]);
   const hasPlan = useMemo(() => Boolean(planDetail), [planDetail]);
+
+  const handleVariableChange = (name: string, value: string) => {
+    applyPlanVariables({ [name]: value });
+  };
 
   return (
     <ThemeProvider theme={theme}>
@@ -68,10 +85,13 @@ export default function App() {
         onSynthesize={synthesizePlan}
         onStartRun={startRun}
         onSavePlan={savePlan}
+        onLoadPlan={loadPlan}
+        onRefreshPlans={refreshPlans}
         isRecording={isRecording}
         hasRecording={hasRecording}
         hasPlan={hasPlan}
         providerLabel={providerLabel}
+        planSummaries={planSummaries}
       />
       <Container maxWidth="xl" sx={{ py: 6 }}>
         <Stack direction={{ xs: 'column', lg: 'row' }} spacing={4} alignItems="flex-start">
@@ -84,6 +104,9 @@ export default function App() {
               currentFrame={currentFrame}
               prompt={prompt}
               onConfirmPrompt={confirmPrompt}
+              variableRequest={variableRequest}
+              onSubmitVariables={submitVariables}
+              onAbortVariables={abortVariables}
             />
           </Box>
           <Stack spacing={4} sx={{ flex: 1, width: '100%' }}>
@@ -92,7 +115,16 @@ export default function App() {
               markers={markers}
               onSelectFrame={(frame) => setCurrentFrame({ png: frame.png })}
             />
-            <PlanPanel planDetail={planDetail ?? null} runStepStatus={runStepStatus} />
+            <VariableHintsPanel
+              variableHints={variableHints}
+              onVariableHintsChange={setVariableHints}
+              disabled={!hasRecording || hasPlan}
+            />
+            <PlanPanel
+              planDetail={planDetail ?? null}
+              runStepStatus={runStepStatus}
+              onVariableChange={handleVariableChange}
+            />
           </Stack>
         </Stack>
       </Container>

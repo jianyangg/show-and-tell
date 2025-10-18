@@ -16,6 +16,7 @@ htmlcov/
 coverage.xml
 
 backend/data/recordings/
+backend/app/data/
 
 # Playwright
 playwright-report/

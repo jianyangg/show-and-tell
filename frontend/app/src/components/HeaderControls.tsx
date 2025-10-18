@@ -5,7 +5,6 @@ import {
   TextField,
   MenuItem,
   Button,
-  Stack,
   Dialog,
   DialogTitle,
   DialogContent,
@@ -14,10 +13,13 @@ import {
   Select,
   FormControl,
   InputLabel,
+  Chip,
+  Stack,
+  Tooltip,
 } from '@mui/material';
 import { SelectChangeEvent } from '@mui/material/Select';
 import { styled } from '../stitches.config';
-import { SynthProvider, useAppStore } from '../store/appStore';
+import { SynthProvider, PlanSummary, useAppStore } from '../store/appStore';
 
 const PROVIDER_STORAGE_KEY = 'plan-synth-provider';
 
@@ -28,29 +30,33 @@ const HeaderBar = styled(AppBar, {
   backdropFilter: 'blur(16px)',
 });
 
-const ControlsStack = styled(Stack, {
+const HeaderRow = styled('div', {
   width: '100%',
   display: 'flex',
-  flexDirection: 'row',
   alignItems: 'center',
   justifyContent: 'space-between',
   gap: '$5',
-  flexWrap: 'wrap',
 });
 
-const FieldStack = styled(Stack, {
+const FieldGroup = styled('div', {
   display: 'flex',
-  flexDirection: 'row',
-  flexWrap: 'wrap',
-  gap: '$4',
+  flex: 1,
+  minWidth: 0,
   alignItems: 'center',
+  gap: '$4',
+  flexWrap: 'nowrap',
+  overflowX: 'auto',
+  paddingRight: '$2',
+  '& > *': {
+    flexShrink: 0,
+  },
 });
 
-const ActionsStack = styled(Stack, {
+const ActionsGroup = styled('div', {
   display: 'flex',
-  flexDirection: 'row',
+  alignItems: 'center',
   gap: '$3',
-  flexWrap: 'wrap',
+  flexWrap: 'nowrap',
 });
 
 interface HeaderControlsProps {
@@ -59,10 +65,13 @@ interface HeaderControlsProps {
   onSynthesize: () => void;
   onStartRun: () => void;
   onSavePlan: (name: string) => Promise<void> | void;
+  onLoadPlan: (planId: string) => Promise<void> | void;
+  onRefreshPlans: () => Promise<void> | void;
   isRecording: boolean;
   hasRecording: boolean;
   hasPlan: boolean;
   providerLabel: string;
+  planSummaries: PlanSummary[];
 }
 
 export function HeaderControls({
@@ -71,13 +80,17 @@ export function HeaderControls({
   onSynthesize,
   onStartRun,
   onSavePlan,
+  onLoadPlan,
+  onRefreshPlans,
   isRecording,
   hasRecording,
   hasPlan,
   providerLabel,
+  planSummaries,
 }: HeaderControlsProps) {
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [saveName, setSaveName] = useState('');
+  const [selectedPlanId, setSelectedPlanId] = useState('');
 
   const { apiBase, setApiBase, startUrl, setStartUrl, synthProvider, setSynthProvider, planDetail } =
     useAppStore((state) => ({
@@ -113,6 +126,41 @@ export function HeaderControls({
 
   const planName = useMemo(() => planDetail?.plan?.name ?? 'No plan loaded', [planDetail]);
 
+  const hasEmptyVariables = useMemo(() => {
+    if (!planDetail?.plan?.vars) return false;
+    const hasVariables = planDetail?.hasVariables || planDetail?.plan?.hasVariables;
+    if (!hasVariables) return false;
+
+    return Object.entries(planDetail.plan.vars).some(([_, value]) => {
+      const stringValue = value === null || value === undefined ? '' : String(value);
+      return stringValue.trim().length === 0;
+    });
+  }, [planDetail]);
+
+  const runButtonTooltip = useMemo(() => {
+    if (!hasPlan) return 'Generate a plan first';
+    if (hasEmptyVariables) return 'Fill in all variable values before running';
+    return '';
+  }, [hasPlan, hasEmptyVariables]);
+
+  useEffect(() => {
+    if (planDetail?.planId) {
+      setSelectedPlanId(planDetail.planId);
+    }
+  }, [planDetail?.planId]);
+
+  const handlePlanSelect = (event: SelectChangeEvent) => {
+    const value = event.target.value;
+    setSelectedPlanId(value);
+    if (value) {
+      onLoadPlan(value);
+    }
+  };
+
+  const handleRefreshPlans = () => {
+    onRefreshPlans();
+  };
+
   const openSaveDialog = () => {
     if (!hasPlan) return;
     setSaveName(planDetail?.plan?.name ?? '');
@@ -131,22 +179,22 @@ export function HeaderControls({
 
   return (
     <HeaderBar position="sticky" color="transparent">
-      <Toolbar sx={{ width: '100%', alignItems: 'flex-start' }}>
-        <ControlsStack>
-          <FieldStack spacing={2}>
+      <Toolbar sx={{ width: '100%', alignItems: 'center', py: 1 }}>
+        <HeaderRow>
+          <FieldGroup>
             <TextField
               label="API Base"
               value={apiBase}
               onChange={(event) => setApiBase(event.target.value)}
               size="small"
-              sx={{ minWidth: 220 }}
+              sx={{ width: 220 }}
             />
             <TextField
               label="Start URL"
               value={startUrl}
               onChange={(event) => setStartUrl(event.target.value)}
               size="small"
-              sx={{ minWidth: 220 }}
+              sx={{ width: 220 }}
               placeholder="https://example.com"
             />
             <FormControl size="small" sx={{ minWidth: 200 }}>
@@ -161,8 +209,47 @@ export function HeaderControls({
                 <MenuItem value="chatgpt">ChatGPT 5</MenuItem>
               </Select>
             </FormControl>
-          </FieldStack>
-          <ActionsStack direction="row">
+            <FormControl size="small" sx={{ minWidth: 240 }}>
+              <InputLabel id="saved-plan-label">Saved Plan</InputLabel>
+              <Select
+                labelId="saved-plan-label"
+                value={selectedPlanId}
+                label="Saved Plan"
+                onChange={handlePlanSelect}
+                displayEmpty
+                renderValue={(value) => {
+                  if (!value) {
+                    return 'Choose a saved plan';
+                  }
+                  const match = planSummaries.find((plan) => plan.planId === value);
+                  if (!match) {
+                    return value;
+                  }
+                  return match.hasVariables ? `${match.name} (variables)` : match.name;
+                }}
+              >
+                <MenuItem value="">
+                  <em>Choose a saved plan</em>
+                </MenuItem>
+                {planSummaries.map((plan) => (
+                  <MenuItem key={plan.planId} value={plan.planId}>
+                    <Stack direction="row" spacing={1} alignItems="center">
+                      <Typography component="span">
+                        {plan.name} — {new Date(plan.updatedAt).toLocaleString()}
+                      </Typography>
+                      {plan.hasVariables ? (
+                        <Chip label="Variables" size="small" color="warning" variant="outlined" />
+                      ) : null}
+                    </Stack>
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+            <Button variant="outlined" size="small" onClick={handleRefreshPlans}>
+              Refresh plans
+            </Button>
+          </FieldGroup>
+          <ActionsGroup>
             <Button
               variant="contained"
               color="primary"
@@ -182,14 +269,23 @@ export function HeaderControls({
             <Button variant="contained" color="secondary" onClick={onSynthesize} disabled={!hasRecording}>
               Synthesize
             </Button>
-            <Button variant="contained" color="success" onClick={onStartRun} disabled={!hasPlan}>
-              Run steps
-            </Button>
+            <Tooltip title={runButtonTooltip} arrow placement="bottom">
+              <span>
+                <Button
+                  variant="contained"
+                  color="success"
+                  onClick={onStartRun}
+                  disabled={!hasPlan || hasEmptyVariables}
+                >
+                  Run steps
+                </Button>
+              </span>
+            </Tooltip>
             <Button variant="outlined" color="inherit" onClick={openSaveDialog} disabled={!hasPlan}>
               Save plan
             </Button>
-          </ActionsStack>
-        </ControlsStack>
+          </ActionsGroup>
+        </HeaderRow>
       </Toolbar>
       <Dialog open={saveDialogOpen} onClose={closeSaveDialog} fullWidth maxWidth="sm">
         <DialogTitle>Save plan</DialogTitle>

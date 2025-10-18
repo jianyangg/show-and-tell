@@ -8,12 +8,26 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Set, Tuple
 
 from playwright.async_api import Browser, Page, async_playwright
 
-from .synthesis import Plan, PlanStep, VarValue
+from .synthesis import (
+    Plan,
+    PlanStep,
+    VarValue,
+    apply_plan_variables,
+    copy_plan_with_vars,
+    normalize_plan_variables,
+)
+from .navigation import wait_for_embedded_page
 
+from io import BytesIO
+
+try:
+    from PIL import Image  # type: ignore
+except Exception:  # pragma: no cover
+    Image = None  # Pillow optional; visual checks will be disabled if missing
 logger = logging.getLogger(__name__)
 
 RUNNER_VIEWPORT = {"width": 1440, "height": 900}
@@ -22,12 +36,17 @@ NORMALIZED_RANGE = 999
 VIEWPORT = RUNNER_VIEWPORT
 TEACH_FRAME_INTERVAL = float(os.environ.get("TEACH_FRAME_INTERVAL_SECONDS", "1.0"))
 TEACH_MAX_FRAMES = int(os.environ.get("TEACH_MAX_FRAMES", "360"))
-DEFAULT_SEARCH_URL = os.environ.get("RUNNER_DEFAULT_SEARCH_URL", "https://www.google.com/")
+DEFAULT_SEARCH_URL = os.environ.get(
+    "RUNNER_DEFAULT_SEARCH_URL", "https://www.google.com/"
+)
+
+CHECKPOINT_SIMILARITY_THRESHOLD = float(
+    os.environ.get("RUNNER_CHECKPOINT_THRESHOLD", "0.88")
+)
 
 
 class RunnerCallbacks(Protocol):
-    async def publish_event(self, event_type: str, payload: Dict[str, Any]) -> None:
-        ...
+    async def publish_event(self, event_type: str, payload: Dict[str, Any]) -> None: ...
 
     async def publish_frame(
         self,
@@ -35,14 +54,17 @@ class RunnerCallbacks(Protocol):
         *,
         step_id: Optional[str],
         cursor: Optional[Dict[str, float]],
-    ) -> None:
-        ...
+    ) -> None: ...
 
-    async def is_aborted(self) -> bool:
-        ...
+    async def is_aborted(self) -> bool: ...
 
-    async def request_confirmation(self, payload: Dict[str, Any]) -> bool:
-        ...
+    async def request_confirmation(self, payload: Dict[str, Any]) -> bool: ...
+
+    async def request_variables(
+        self, payload: Dict[str, Any]
+    ) -> Dict[str, VarValue]: ...
+
+    async def get_checkpoints(self, step_id: str) -> List[Dict[str, Any]]: ...
 
 
 @dataclass
@@ -98,7 +120,11 @@ class TeachSession:
         encoded = base64.b64encode(png).decode("ascii")
         now = time.time()
         elapsed = now - self.created_at
-        should_store = force or not self.frames or (elapsed - self._last_frame_ts) >= TEACH_FRAME_INTERVAL
+        should_store = (
+            force
+            or not self.frames
+            or (elapsed - self._last_frame_ts) >= TEACH_FRAME_INTERVAL
+        )
         if should_store:
             self.frames.append({"timestamp": elapsed, "png": encoded})
             self._last_frame_ts = elapsed
@@ -141,7 +167,9 @@ class TeachSession:
                 )
             )
 
-    def record_key_up(self, key: Optional[str], extra: Optional[Dict[str, Any]] = None) -> None:
+    def record_key_up(
+        self, key: Optional[str], extra: Optional[Dict[str, Any]] = None
+    ) -> None:
         if not key:
             return
         now = time.time() - self.created_at
@@ -188,9 +216,7 @@ class TeachManager:
         browser = await self._pl.chromium.launch(
             headless=True, args=["--disable-dev-shm-usage"]
         )
-        context = await browser.new_context(
-            viewport=VIEWPORT, device_scale_factor=1.0
-        )
+        context = await browser.new_context(viewport=VIEWPORT, device_scale_factor=1.0)
         page = await context.new_page()
         if start_url:
             if not start_url.startswith(("http://", "https://")):
@@ -303,7 +329,9 @@ class ComputerUseAgent:
                 )
             return
 
-        from google import genai  # Imported lazily so unit tests do not require the SDK.
+        from google import (
+            genai,
+        )  # Imported lazily so unit tests do not require the SDK.
         from google.genai import types
 
         system_prompt = (
@@ -368,7 +396,9 @@ class ComputerUseAgent:
             role="user",
             parts=[
                 self._types.Part(text=prompt_text),
-                self._types.Part.from_bytes(data=screenshot_bytes, mime_type="image/png"),
+                self._types.Part.from_bytes(
+                    data=screenshot_bytes, mime_type="image/png"
+                ),
             ],
         )
 
@@ -414,7 +444,9 @@ class ComputerUseAgent:
                         )
                         if not candidate_url:
                             plan_url = observation.vars.get("url")
-                            candidate_url = plan_url if isinstance(plan_url, str) else None
+                            candidate_url = (
+                                plan_url if isinstance(plan_url, str) else None
+                            )
                         if candidate_url:
                             args["url"] = candidate_url
                 if name not in self.SUPPORTED_ACTIONS:
@@ -427,8 +459,13 @@ class ComputerUseAgent:
             response_summary = json_dumps(
                 [
                     {
-                        "name": getattr(getattr(part, "function_call", None), "name", ""),
-                        "args": dict(getattr(getattr(part, "function_call", None), "args", {}) or {}),
+                        "name": getattr(
+                            getattr(part, "function_call", None), "name", ""
+                        ),
+                        "args": dict(
+                            getattr(getattr(part, "function_call", None), "args", {})
+                            or {}
+                        ),
                     }
                     for part in parts
                     if getattr(part, "function_call", None)
@@ -445,7 +482,11 @@ class ComputerUseAgent:
                 {
                     "name": action.name,
                     "args": action.args,
-                    **({"safety_decision": action.safety_decision} if action.safety_decision else {}),
+                    **(
+                        {"safety_decision": action.safety_decision}
+                        if action.safety_decision
+                        else {}
+                    ),
                 }
                 for action in actions
             ]
@@ -456,7 +497,9 @@ class ComputerUseAgent:
                 "Computer Use proposed actions: %s",
                 response_summary,
             )
-        return AgentDecision(prompt=prompt_text, response_summary=response_summary, actions=actions)
+        return AgentDecision(
+            prompt=prompt_text, response_summary=response_summary, actions=actions
+        )
 
 
 class PlanRunner:
@@ -464,6 +507,42 @@ class PlanRunner:
 
     def __init__(self) -> None:
         self._agent = ComputerUseAgent()
+        # cache: step_id -> List[Tuple[str|None, int]]  (label, aHash)
+        self._checkpoint_hash_cache: Dict[str, List[Tuple[Optional[str], int]]] = {}
+
+    # --- Visual checkpoint helpers ------------------------------------------------
+    def _decode_base64_png(png_b64: str) -> Optional["Image.Image"]:
+        if Image is None:
+            return None
+        try:
+            raw = base64.b64decode(png_b64.encode("ascii"))
+            return Image.open(BytesIO(raw)).convert("L")
+        except Exception:
+            return None
+
+    def _ahash(img: "Image.Image", size: int = 16) -> Optional[int]:
+        try:
+            # Downscale to size x size, compute average, and threshold to bits
+            small = img.resize((size, size))
+            pixels = list(small.getdata())
+            avg = sum(pixels) / (size * size)
+            bits = 0
+            for p in pixels:
+                bits = (bits << 1) | (1 if p >= avg else 0)
+            return bits
+        except Exception:
+            return None
+
+    def _hamming_distance(a: int, b: int) -> int:
+        x = a ^ b
+        # Count set bits
+        return x.bit_count() if hasattr(int, "bit_count") else bin(x).count("1")
+
+    def _hash_similarity(a: int, b: int, size: int = 16) -> float:
+        # 1.0 == identical, 0.0 == totally different
+        max_bits = size * size
+        dist = _hamming_distance(a, b)
+        return max(0.0, 1.0 - (dist / max_bits))
 
     async def run(
         self,
@@ -475,7 +554,9 @@ class PlanRunner:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
             try:
-                await self._execute_with_browser(browser, plan, start_url=start_url, callbacks=callbacks)
+                await self._execute_with_browser(
+                    browser, plan, start_url=start_url, callbacks=callbacks
+                )
             finally:
                 await browser.close()
 
@@ -504,6 +585,10 @@ class PlanRunner:
                 if not start_url.startswith(("http://", "https://")):
                     start_url = f"https://{start_url}"
                 await page.goto(start_url, wait_until="domcontentloaded")
+                try:
+                    await wait_for_embedded_page(page, start_url)
+                except RuntimeError as exc:
+                    raise RunnerError(f"Start url iframe not ready: {exc}") from exc
                 await callbacks.publish_event(
                     "navigate",
                     {"kind": "start_url", "url": start_url},
@@ -511,12 +596,16 @@ class PlanRunner:
 
             await self._emit_frame(callbacks, page, step_id=None, cursor=None)
 
+            plan = await self._prepare_plan_variables(plan, callbacks)
+
             history: List[str] = []
             for raw_step in plan.steps:
                 if await callbacks.is_aborted():
                     raise AbortRequested()
                 step = self._resolve_step(raw_step, plan.vars)
-                await callbacks.publish_event("step_started", {"stepId": step.id, "title": step.title})
+                await callbacks.publish_event(
+                    "step_started", {"stepId": step.id, "title": step.title}
+                )
                 if getattr(step, "instructions", None):
                     await callbacks.publish_event(
                         "console",
@@ -526,10 +615,147 @@ class PlanRunner:
                 await self._run_step(page, plan, step, history, callbacks)
                 await callbacks.publish_event("step_completed", {"stepId": step.id})
 
-            await callbacks.publish_event("run_completed", {"ok": True, "url": page.url})
+            await callbacks.publish_event(
+                "run_completed", {"ok": True, "url": page.url}
+            )
         finally:
             await page.close()
             await context.close()
+
+    async def _prepare_plan_variables(
+        self,
+        plan: Plan,
+        callbacks: RunnerCallbacks,
+    ) -> Plan:
+        plan, placeholders = normalize_plan_variables(plan)
+        if not placeholders:
+            return plan
+        missing = self._missing_plan_variables(plan, placeholders)
+        if not missing:
+            return plan
+        await callbacks.publish_event(
+            "console",
+            {
+                "role": "Runner",
+                "message": "Awaiting variable values for: " + ", ".join(missing),
+            },
+        )
+        payload: Dict[str, Any] = {
+            "vars": [
+                {"name": name, "value": plan.vars.get(name, "")} for name in missing
+            ]
+        }
+        if await callbacks.is_aborted():
+            raise AbortRequested()
+        try:
+            provided = await callbacks.request_variables(payload)
+        except AbortRequested:
+            raise
+        except Exception as exc:
+            raise RunnerError(f"Variable handshake failed: {exc}") from exc
+        if not isinstance(provided, dict):
+            raise RunnerError("Variable handshake returned invalid payload")
+        if await callbacks.is_aborted():
+            raise AbortRequested()
+        sanitized = dict(plan.vars)
+        missing_after: List[str] = []
+        for name in missing:
+            if name not in provided:
+                missing_after.append(name)
+                continue
+            coerced = self._coerce_runtime_variable(provided[name])
+            if coerced is None:
+                missing_after.append(name)
+                continue
+            sanitized[name] = coerced
+        if missing_after:
+            raise RunnerError(
+                "Missing values for variables: " + ", ".join(sorted(missing_after))
+            )
+        plan = copy_plan_with_vars(plan, sanitized)
+        await callbacks.publish_event(
+            "variables_applied",
+            {"vars": {name: sanitized[name] for name in sorted(missing)}},
+        )
+        return plan
+
+    def _missing_plan_variables(self, plan: Plan, placeholders: Set[str]) -> List[str]:
+        missing: List[str] = []
+        for name in sorted(placeholders):
+            if name not in plan.vars:
+                missing.append(name)
+                continue
+            value = plan.vars[name]
+            if isinstance(value, str):
+                if value.strip():
+                    continue
+                missing.append(name)
+            elif value is None:
+                missing.append(name)
+        return missing
+
+    def _coerce_runtime_variable(self, value: Any) -> Optional[VarValue]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return value
+        text = str(value).strip()
+        return text or None
+
+    async def _get_step_checkpoints(
+        self, callbacks: RunnerCallbacks, step_id: str
+    ) -> List[Dict[str, Any]]:
+        # Best-effort: callbacks may not implement get_checkpoints yet.
+        try:
+            cps = await callbacks.get_checkpoints(step_id)  # type: ignore[attr-defined]
+            if not isinstance(cps, list):
+                return []
+            # Expected schema for each checkpoint:
+            # {"png_base64": str, "label": Optional[str]}
+            return [cp for cp in cps if isinstance(cp, dict) and "png_base64" in cp]
+        except AttributeError:
+            return []
+        except Exception:
+            logger.exception("Failed to fetch checkpoints for step %s", step_id)
+            return []
+
+    def _ensure_checkpoint_hashes(
+        self, step_id: str, checkpoints: List[Dict[str, Any]]
+    ) -> None:
+        if step_id in self._checkpoint_hash_cache:
+            return
+        results: List[Tuple[Optional[str], int]] = []
+        for cp in checkpoints:
+            img = _decode_base64_png(cp.get("png_base64", ""))
+            if img is None:
+                continue
+            h = _ahash(img)
+            if h is None:
+                continue
+            results.append((cp.get("label"), h))
+        if results:
+            self._checkpoint_hash_cache[step_id] = results
+
+    def _visual_match_score(
+        self, screenshot_b64: str, step_id: str
+    ) -> Tuple[float, Optional[str]]:
+        """Return best similarity score in [0,1] against cached checkpoints for step_id."""
+        if step_id not in self._checkpoint_hash_cache:
+            return (0.0, None)
+        img = _decode_base64_png(screenshot_b64)
+        if img is None:
+            return (0.0, None)
+        h = _ahash(img)
+        if h is None:
+            return (0.0, None)
+        best = (0.0, None)  # (score, label)
+        for label, cp_hash in self._checkpoint_hash_cache[step_id]:
+            score = _hash_similarity(h, cp_hash)
+            if score > best[0]:
+                best = (score, label)
+        return best
 
     async def _run_step(
         self,
@@ -539,13 +765,18 @@ class PlanRunner:
         history: List[str],
         callbacks: RunnerCallbacks,
     ) -> None:
+        # Fetch any reference frames for this step (if provided by the caller)
+        checkpoints = await self._get_step_checkpoints(callbacks, step.id)
+        require_visual_match = bool(checkpoints)
+        if require_visual_match:
+            self._ensure_checkpoint_hashes(step.id, checkpoints)
         for turn in range(1, MAX_TURNS_PER_STEP + 1):
             if await callbacks.is_aborted():
                 raise AbortRequested()
 
             screenshot = await self._capture(page)
             observation = AgentObservation(
-                goal=plan.name,
+                goal=_apply_vars(plan.name, plan.vars) or plan.name,
                 screenshot=screenshot,
                 url=page.url,
                 turn=turn,
@@ -564,7 +795,10 @@ class PlanRunner:
                 if exc.response_summary:
                     await callbacks.publish_event(
                         "console",
-                        {"role": "ComputerUse response", "message": exc.response_summary},
+                        {
+                            "role": "ComputerUse response",
+                            "message": exc.response_summary,
+                        },
                     )
                 raise
             await callbacks.publish_event(
@@ -584,6 +818,7 @@ class PlanRunner:
 
             turn_cursor: Optional[Dict[str, float]] = None
             summaries: List[str] = []
+            action_failed = False
             for action in decision.actions:
                 if action.safety_decision == "require_confirmation":
                     allowed = await callbacks.request_confirmation(
@@ -592,22 +827,76 @@ class PlanRunner:
                     if not allowed:
                         raise RunnerError("Action declined by operator")
 
-                summary, cursor = await self._apply_action(page, action)
+                try:
+                    summary, cursor = await self._apply_action(page, action)
+                except RunnerError as exc:
+                    error_message = str(exc)
+                    await callbacks.publish_event(
+                        "console",
+                        {
+                            "role": "Runner",
+                            "message": f"Action failed: {error_message}",
+                        },
+                    )
+                    history.append(f"error: {error_message}")
+                    action_failed = True
+                    break
                 turn_cursor = cursor or turn_cursor
                 summaries.append(summary)
                 history.append(summary)
                 await callbacks.publish_event(
                     "action_executed",
-                    {"stepId": step.id, "action": action.name, "args": action.args, "summary": summary},
+                    {
+                        "stepId": step.id,
+                        "action": action.name,
+                        "args": action.args,
+                        "summary": summary,
+                    },
                 )
-                await self._emit_frame(callbacks, page, step_id=step.id, cursor=turn_cursor)
+                await self._emit_frame(
+                    callbacks, page, step_id=step.id, cursor=turn_cursor
+                )
 
             await self._emit_frame(callbacks, page, step_id=step.id, cursor=turn_cursor)
-            return
+
+            if action_failed:
+                continue
+
+            # Decide if the step is complete
+            if require_visual_match:
+                latest = await self._capture(page)
+                score, label = self._visual_match_score(latest, step.id)
+                await callbacks.publish_event(
+                    "checkpoint_evaluated",
+                    {
+                        "stepId": step.id,
+                        "score": round(score, 4),
+                        "threshold": CHECKPOINT_SIMILARITY_THRESHOLD,
+                        **({"label": label} if label else {}),
+                    },
+                )
+                if score >= CHECKPOINT_SIMILARITY_THRESHOLD:
+                    await callbacks.publish_event(
+                        "checkpoint_matched",
+                        {
+                            "stepId": step.id,
+                            "score": round(score, 4),
+                            **({"label": label} if label else {}),
+                        },
+                    )
+                    return
+                # Not yet matched; try another turn (until MAX_TURNS_PER_STEP)
+                continue
+            else:
+                # Backward compatible: if no checkpoints provided for this step,
+                # consider the step complete after a single turn (previous behavior).
+                return
 
         raise RunnerError(f"Exceeded max turns for step {step.id}")
 
-    async def _apply_action(self, page: Page, action: AgentAction) -> tuple[str, Optional[Dict[str, float]]]:
+    async def _apply_action(
+        self, page: Page, action: AgentAction
+    ) -> tuple[str, Optional[Dict[str, float]]]:
         name = action.name
         args = action.args
 
@@ -728,7 +1017,10 @@ class PlanRunner:
             dest_y_norm = _to_float(args.get("destination_y", 0.0))
             x_px, y_px = _denormalize_point(x_norm, y_norm)
             dest_x_px, dest_y_px = _denormalize_point(dest_x_norm, dest_y_norm)
-            cursor = {"x": dest_x_norm / NORMALIZED_RANGE, "y": dest_y_norm / NORMALIZED_RANGE}
+            cursor = {
+                "x": dest_x_norm / NORMALIZED_RANGE,
+                "y": dest_y_norm / NORMALIZED_RANGE,
+            }
             await page.mouse.move(x_px, y_px)
             await page.mouse.down()
             await page.mouse.move(dest_x_px, dest_y_px, steps=20)
@@ -767,16 +1059,7 @@ class PlanRunner:
 
 
 def _apply_vars(value: Optional[str], vars: Dict[str, VarValue]) -> Optional[str]:
-    if value is None:
-        return None
-
-    def repl(match: re.Match[str]) -> str:
-        key = match.group(1)
-        if key in vars:
-            return str(vars[key])
-        return match.group(0)
-
-    return re.sub(r"{([^}]+)}", repl, value)
+    return apply_plan_variables(value, vars)
 
 
 def _extract_first_url(text: Optional[str]) -> Optional[str]:
@@ -836,3 +1119,10 @@ def json_dumps(payload: Any) -> str:
     import json
 
     return json.dumps(payload, ensure_ascii=False)
+
+
+# Expected get_checkpoints() return format:
+# List[{"png_base64": <base64 PNG string>, "label": Optional[str]}]
+# You can source these frames from storage.py or synthesis.py (e.g., plan synthesis
+# can annotate step IDs with representative screenshots taken during Teach mode).
+# To tune strictness, set RUNNER_CHECKPOINT_THRESHOLD (default 0.88).

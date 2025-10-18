@@ -7,9 +7,9 @@ import logging
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
-from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -36,6 +36,9 @@ from .synthesis import (
     RecordingBundle,
     RecordingFrame,
     RecordingMarker,
+    VarValue,
+    copy_plan_with_vars,
+    normalize_plan_variables,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,22 +78,128 @@ _FOCUS_INTROSPECTION_SCRIPT = """
         return null;
     }
 
+    const getRole = (el) => {
+        if (!el || el.nodeType !== 1) return null;
+        const explicit = el.getAttribute && el.getAttribute("role");
+        if (explicit) return explicit;
+        const tag = el.tagName ? el.tagName.toLowerCase() : "";
+        if (tag === "a" && el.getAttribute("href")) return "link";
+        if (["button", "summary", "details"].includes(tag)) return "button";
+        if (["input", "textarea", "select"].includes(tag)) return "textbox";
+        return null;
+    };
+
+    const textFromIds = (ids) => {
+        if (!ids) return "";
+        const parts = [];
+        ids.split(" ").forEach((id) => {
+            const ref = doc.getElementById(id);
+            if (ref) {
+                const t = (ref.innerText || ref.textContent || "").trim();
+                if (t) parts.push(t);
+            }
+        });
+        return parts.join(" ");
+    };
+
+    const accessibleName = (el) => {
+        if (!el) return null;
+        const ariaLabel = el.getAttribute && el.getAttribute("aria-label");
+        if (ariaLabel && ariaLabel.trim()) return ariaLabel.trim().slice(0, 200);
+        const ariaLabelledBy = el.getAttribute && el.getAttribute("aria-labelledby");
+        const labelled = textFromIds(ariaLabelledBy);
+        if (labelled) return labelled.slice(0, 200);
+        // Associated <label for=id>
+        if (el.id) {
+            const lab = doc.querySelector(`label[for="${el.id.replace(/"/g, '\\"')}"]`);
+            if (lab) {
+                const t = (lab.innerText || lab.textContent || "").trim();
+                if (t) return t.slice(0, 200);
+            }
+        }
+        // Wrapping <label>
+        const wrapping = el.closest && el.closest("label");
+        if (wrapping) {
+            const t = (wrapping.innerText || wrapping.textContent || "").trim();
+            if (t) return t.slice(0, 200);
+        }
+        const title = el.getAttribute && el.getAttribute("title");
+        if (title && title.trim()) return title.trim().slice(0, 200);
+        const placeholder = el.getAttribute && el.getAttribute("placeholder");
+        if (placeholder && placeholder.trim()) return placeholder.trim().slice(0, 200);
+        const alt = el.getAttribute && el.getAttribute("alt");
+        if (alt && alt.trim()) return alt.trim().slice(0, 200);
+        const text = (el.innerText || el.textContent || "").trim();
+        if (text) return text.slice(0, 200);
+        return null;
+    };
+
+    const cssPath = (el) => {
+        if (!el || el.nodeType !== 1) return null;
+        const parts = [];
+        let node = el;
+        let depth = 0;
+        while (node && node.nodeType === 1 && depth < 8) {
+            let selector = node.tagName ? node.tagName.toLowerCase() : "element";
+            if (node.id) {
+                selector += `#${node.id}`;
+                parts.unshift(selector);
+                break;
+            }
+            if (node.classList && node.classList.length) {
+                selector += "." + Array.from(node.classList).slice(0, 3).join(".");
+            }
+            const parent = node.parentElement;
+            if (parent) {
+                const siblings = Array.from(parent.children).filter(n => n.tagName === node.tagName);
+                if (siblings.length > 1) {
+                    selector += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+                }
+            }
+            parts.unshift(selector);
+            node = parent || (node.getRootNode && node.getRootNode().host) || null;
+            depth++;
+        }
+        return parts.join(" > ");
+    };
+
+    const buildCandidates = (el) => {
+        const cands = [];
+        if (!el || el.nodeType !== 1) return cands;
+        const id = el.id && el.id.trim();
+        const dti = el.getAttribute && el.getAttribute("data-testid");
+        const dqa = el.getAttribute && el.getAttribute("data-qa");
+        const name = el.getAttribute && el.getAttribute("name");
+        const role = getRole(el);
+        const aname = accessibleName(el);
+
+        if (id) cands.push({ by: "css", value: `#${id}` });
+        if (dti) cands.push({ by: "css", value: `[data-testid="${dti}"]` });
+        if (dqa) cands.push({ by: "css", value: `[data-qa="${dqa}"]` });
+        if (name && /^(input|textarea|select)$/i.test(el.tagName)) {
+            cands.push({ by: "css", value: `${el.tagName.toLowerCase()}[name="${name}"]` });
+        }
+        if (role && aname) cands.push({ by: "role", role, name: aname });
+        const path = cssPath(el);
+        if (path) cands.push({ by: "css", value: path });
+        return cands;
+    };
+
     const describeNode = (el) => {
         if (!el || el.nodeType !== 1) return null;
         const tag = el.tagName ? el.tagName.toLowerCase() : "element";
-        const id = el.id ? `#${el.id}` : "";
-        const classes = el.classList ? Array.from(el.classList).slice(0, 3).map((cls) => `.${cls}`).join("") : "";
-        const nameAttr = el.getAttribute ? el.getAttribute("name") : null;
-        const roleAttr = el.getAttribute ? el.getAttribute("role") : null;
-        const typeAttr = el.getAttribute ? el.getAttribute("type") : null;
-        const ariaLabel = el.getAttribute ? el.getAttribute("aria-label") : null;
+        const id = el.id || null;
+        const classes = el.classList ? Array.from(el.classList).slice(0, 3) : [];
+        const role = getRole(el);
+        const name = accessibleName(el);
         const placeholder = el.getAttribute ? el.getAttribute("placeholder") : null;
+        const valuePreview = typeof el.value === "string" && el.value.trim() ? el.value.trim().slice(0, 120) : null;
         return {
-            tag,
-            descriptor: `${tag}${id}${classes}${nameAttr ? `[name=\"${nameAttr}\"]` : ""}${roleAttr ? `[role=\"${roleAttr}\"]` : ""}${typeAttr ? `[type=\"${typeAttr}\"]` : ""}`,
-            ariaLabel: ariaLabel && ariaLabel.trim() ? ariaLabel.trim().slice(0, 120) : null,
-            placeholder: placeholder && placeholder.trim() ? placeholder.trim().slice(0, 120) : null,
-            valuePreview: typeof el.value === "string" && el.value.trim() ? el.value.trim().slice(0, 120) : null,
+            tag, id, class: classes.join(" "),
+            role, name, ariaLabel: el.getAttribute && el.getAttribute("aria-label"),
+            placeholder, valuePreview,
+            selector: cssPath(el),
+            candidates: buildCandidates(el)
         };
     };
 
@@ -100,35 +209,34 @@ _FOCUS_INTROSPECTION_SCRIPT = """
     while (node && node.nodeType === 1 && !seen.has(node)) {
         seen.add(node);
         const info = describeNode(node);
-        if (info) {
-            hierarchy.push(info);
-        }
+        if (info) hierarchy.push(info);
         if (node.parentElement) {
             node = node.parentElement;
             continue;
         }
         const root = node.getRootNode?.();
         if (root && root.host) {
-            node = root.host;
+            node = root.host; // step out of shadow root
             continue;
         }
         break;
     }
 
-    if (!hierarchy.length) {
-        return null;
-    }
-
+    if (!hierarchy.length) return null;
     const top = hierarchy[0];
-    const selector = hierarchy.slice(0, 6).map((info) => info.descriptor).filter(Boolean).join(" > ");
+    const primary = (top.candidates && top.candidates[0]) || null;
 
     return {
-        selector,
         tag: top.tag,
-        ariaLabel: top.ariaLabel,
-        placeholder: top.placeholder,
-        valuePreview: top.valuePreview,
-        hierarchy: hierarchy.slice(0, 8).map((info) => info.descriptor),
+        role: top.role || null,
+        name: top.name || null,
+        ariaLabel: top.ariaLabel || null,
+        placeholder: top.placeholder || null,
+        valuePreview: top.valuePreview || null,
+        selector: top.selector || null,
+        candidates: top.candidates || [],
+        primaryLocator: primary,
+        hierarchy: hierarchy.slice(0, 8).map((n) => n.selector || n.tag)
     };
 }
 """
@@ -136,55 +244,109 @@ _FOCUS_INTROSPECTION_SCRIPT = """
 _CLICK_INTROSPECTION_SCRIPT = """
 ([x, y]) => {
     const doc = document;
-    const element = doc.elementFromPoint(x, y);
-    if (!element) return null;
 
-    const toCssPath = (el) => {
-        if (!el || !el.parentElement) return null;
-        const segments = [];
+    const getRole = (el) => {
+        if (!el || el.nodeType !== 1) return null;
+        const explicit = el.getAttribute && el.getAttribute("role");
+        if (explicit) return explicit;
+        const tag = el.tagName ? el.tagName.toLowerCase() : "";
+        if (tag === "a" && el.getAttribute("href")) return "link";
+        if (["button", "summary", "details"].includes(tag)) return "button";
+        if (tag === "input") {
+            const type = (el.getAttribute("type") || "").toLowerCase();
+            if (["button", "submit", "reset", "checkbox", "radio", "file"].includes(type)) return "button";
+            return "textbox";
+        }
+        if (["select", "textarea"].includes(tag)) return "textbox";
+        return null;
+    };
+
+    const textFromIds = (ids) => {
+        if (!ids) return "";
+        const parts = [];
+        ids.split(" ").forEach((id) => {
+            const ref = doc.getElementById(id);
+            if (ref) {
+                const t = (ref.innerText || ref.textContent || "").trim();
+                if (t) parts.push(t);
+            }
+        });
+        return parts.join(" ");
+    };
+
+    const accessibleName = (el) => {
+        if (!el) return null;
+        const ariaLabel = el.getAttribute && el.getAttribute("aria-label");
+        if (ariaLabel && ariaLabel.trim()) return ariaLabel.trim().slice(0, 200);
+        const ariaLabelledBy = el.getAttribute && el.getAttribute("aria-labelledby");
+        const labelled = textFromIds(ariaLabelledBy);
+        if (labelled) return labelled.slice(0, 200);
+        if (el.id) {
+            const lab = doc.querySelector(`label[for="${el.id.replace(/"/g, '\\"')}"]`);
+            if (lab) {
+                const t = (lab.innerText || lab.textContent || "").trim();
+                if (t) return t.slice(0, 200);
+            }
+        }
+        const wrapping = el.closest && el.closest("label");
+        if (wrapping) {
+            const t = (wrapping.innerText || wrapping.textContent || "").trim();
+            if (t) return t.slice(0, 200);
+        }
+        const title = el.getAttribute && el.getAttribute("title");
+        if (title && title.trim()) return title.trim().slice(0, 200);
+        const text = (el.innerText || el.textContent || "").trim();
+        if (text) return text.slice(0, 200);
+        return null;
+    };
+
+    const cssPath = (el) => {
+        if (!el || el.nodeType !== 1) return null;
+        const parts = [];
         let node = el;
         let depth = 0;
         while (node && node.nodeType === 1 && depth < 8) {
             let selector = node.tagName ? node.tagName.toLowerCase() : "element";
             if (node.id) {
                 selector += `#${node.id}`;
-                segments.unshift(selector);
+                parts.unshift(selector);
                 break;
             }
             if (node.classList && node.classList.length) {
                 selector += "." + Array.from(node.classList).slice(0, 3).join(".");
             }
-            let siblingIndex = 1;
-            let sibling = node.previousElementSibling;
-            while (sibling) {
-                if (sibling.tagName === node.tagName) siblingIndex += 1;
-                sibling = sibling.previousElementSibling;
+            const parent = node.parentElement;
+            if (parent) {
+                const siblings = Array.from(parent.children).filter(n => n.tagName === node.tagName);
+                if (siblings.length > 1) {
+                    selector += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+                }
             }
-            if (siblingIndex > 1) {
-                selector += `:nth-of-type(${siblingIndex})`;
-            }
-            segments.unshift(selector);
-            node = node.parentElement;
-            depth += 1;
+            parts.unshift(selector);
+            // Step through shadow host if present
+            const root = node.getRootNode && node.getRootNode();
+            node = parent || (root && root.host) || null;
+            depth++;
         }
-        return segments.join(" > ");
+        return parts.join(" > ");
     };
 
-    const labelFor = (el) => {
-        if (!el) return null;
-        const ariaLabel = el.getAttribute && el.getAttribute("aria-label");
-        if (ariaLabel && ariaLabel.trim()) return ariaLabel.trim().slice(0, 120);
-        const ariaLabelledBy = el.getAttribute && el.getAttribute("aria-labelledby");
-        if (ariaLabelledBy) {
-            const ref = ariaLabelledBy.split(" ").map((id) => id && doc.getElementById(id)).filter(Boolean).map((refEl) => refEl.innerText || refEl.textContent || "").join(" ");
-            if (ref && ref.trim()) return ref.trim().slice(0, 120);
-        }
-        const title = el.getAttribute && el.getAttribute("title");
-        if (title && title.trim()) return title.trim().slice(0, 120);
-        const text = el.innerText || el.textContent || "";
-        const normalized = text.replace(/\\s+/g, " ").trim();
-        if (normalized) return normalized.slice(0, 120);
-        return null;
+    const buildCandidates = (el) => {
+        const cands = [];
+        if (!el || el.nodeType !== 1) return cands;
+        const id = el.id && el.id.trim();
+        const dti = el.getAttribute && el.getAttribute("data-testid");
+        const dqa = el.getAttribute && el.getAttribute("data-qa");
+        const role = getRole(el);
+        const aname = accessibleName(el);
+
+        if (id) cands.push({ by: "css", value: `#${id}` });
+        if (dti) cands.push({ by: "css", value: `[data-testid="${dti}"]` });
+        if (dqa) cands.push({ by: "css", value: `[data-qa="${dqa}"]` });
+        if (role && aname) cands.push({ by: "role", role, name: aname });
+        const path = cssPath(el);
+        if (path) cands.push({ by: "css", value: path });
+        return cands;
     };
 
     const isActionable = (el) => {
@@ -197,7 +359,7 @@ _CLICK_INTROSPECTION_SCRIPT = """
             const type = (el.getAttribute("type") || "").toLowerCase();
             if (["button", "submit", "reset", "checkbox", "radio", "file"].includes(type)) return true;
         }
-        const role = el.getAttribute ? el.getAttribute("role") : null;
+        const role = el.getAttribute && el.getAttribute("role");
         if (role && ["button", "link", "tab", "switch", "menuitem", "option", "checkbox"].includes(role)) return true;
         if (el.getAttribute && (el.getAttribute("onclick") || el.getAttribute("href") || el.getAttribute("for"))) return true;
         const style = window.getComputedStyle(el);
@@ -205,7 +367,14 @@ _CLICK_INTROSPECTION_SCRIPT = """
         return false;
     };
 
+    // Prefer the top-most actionable in the composed tree
+    const list = (doc.elementsFromPoint ? doc.elementsFromPoint(x, y) : [doc.elementFromPoint(x, y)]).filter(Boolean);
+    if (!list.length) return null;
+    const element = list[0];
     let actionable = element;
+    for (const el of list) {
+        if (isActionable(el)) { actionable = el; break; }
+    }
     while (actionable && actionable !== doc.body && !isActionable(actionable)) {
         actionable = actionable.parentElement;
     }
@@ -213,14 +382,17 @@ _CLICK_INTROSPECTION_SCRIPT = """
     const summarize = (el) => {
         if (!el) return null;
         const tag = el.tagName ? el.tagName.toLowerCase() : null;
-        const role = el.getAttribute ? el.getAttribute("role") : null;
+        const role = getRole(el);
         const typeAttr = el.getAttribute ? el.getAttribute("type") : null;
+        const name = accessibleName(el);
         return {
             tag,
-            cssPath: toCssPath(el),
-            label: labelFor(el),
-            role: role,
+            role,
+            name,
+            cssPath: cssPath(el),
+            label: name,
             type: typeAttr,
+            candidates: buildCandidates(el)
         };
     };
 
@@ -229,8 +401,16 @@ _CLICK_INTROSPECTION_SCRIPT = """
         actionable: summarize(actionable || element),
         clickable: !!(actionable && actionable !== element),
     };
-    const preferred = info.actionable && info.actionable.cssPath ? info.actionable : info.element;
-    info.bestSelector = preferred ? preferred.cssPath : null;
+    const preferred = (info.actionable && info.actionable.candidates && info.actionable.candidates.length)
+        ? info.actionable
+        : info.element;
+
+    const candidates = (preferred && preferred.candidates) ? preferred.candidates : [];
+    const primary = candidates[0] || null;
+
+    info.bestSelector = (primary && primary.by === "css") ? primary.value : (preferred ? preferred.cssPath : null);
+    info.selectorCandidates = candidates;
+    info.primaryLocator = primary; // {by: 'css'|'role', value?|role+name}
     return info;
 }
 """
@@ -282,7 +462,9 @@ async def teach_start(payload: Dict[str, Any] = Body(default={})):
     )
     try:
         stored_recording = await recording_store.start(
-            title=None, recording_id=recording_id
+            title=None,
+            recording_id=recording_id,
+            start_url=payload.get("startUrl"),
         )
     except Exception:
         with contextlib.suppress(Exception):
@@ -405,6 +587,8 @@ async def ws_teach(ws: WebSocket, teach_id: str):
                             "actionable": click_meta.get("actionable"),
                             "selector": click_meta.get("bestSelector"),
                             "clickable": click_meta.get("clickable"),
+                            "primaryLocator": click_meta.get("primaryLocator"),
+                            "selectorCandidates": click_meta.get("selectorCandidates"),
                         }
                     )
                 session.log("click", **event_payload)
@@ -451,8 +635,45 @@ async def ws_teach(ws: WebSocket, teach_id: str):
                     event_payload["selector"] = focus_info.get("selector")
                     event_payload["focus"] = focus_info
                 session.record_key_up(key, extra=event_payload)
+            elif msg_type == "probe_dom":
+                reason = payload.get("reason") or "probe"
+                # Two probe modes:
+                # - focus/activeElement: describe the currently focused element
+                # - coordinate probe: describe element at (x,y)
+                if reason in ("focus", "activeElement"):
+                    info = await _describe_focused_element(page)
+                    await ws.send_json({"type": "dom_probe", "target": info, "reason": "focus"})
+                else:
+                    try:
+                        x = float(payload.get("x", 0))
+                        y = float(payload.get("y", 0))
+                    except Exception:
+                        x, y = 0.0, 0.0
+                    info = await _describe_click_target(page, x, y)
+                    await ws.send_json(
+                        {
+                            "type": "dom_probe",
+                            "target": info,
+                            "x": x,
+                            "y": y,
+                            "reason": reason,
+                        }
+                    )
+                    # Optionally append to event log for downstream synthesis
+                    if info:
+                        session.log(
+                            "dom_probe",
+                            x=x,
+                            y=y,
+                            selector=info.get("bestSelector"),
+                            element=info.get("element"),
+                            actionable=info.get("actionable"),
+                            clickable=info.get("clickable"),
+                            primaryLocator=info.get("primaryLocator"),
+                            selectorCandidates=info.get("selectorCandidates"),
+                        )
 
-            if session.events and len(session.events) % 5 == 0:
+            if session.events:
                 recent = [
                     {"ts": event.ts, "kind": event.kind, **event.data}
                     for event in session.events[-50:]
@@ -512,6 +733,19 @@ class RecordingDetailResponse(APIModel):
     updated_at: datetime = Field(..., alias="updatedAt")
 
 
+class RecordingSummary(APIModel):
+    recording_id: str = Field(..., alias="recordingId")
+    title: Optional[str] = None
+    status: str
+    created_at: datetime = Field(..., alias="createdAt")
+    updated_at: datetime = Field(..., alias="updatedAt")
+    ended_at: Optional[datetime] = Field(default=None, alias="endedAt")
+
+
+class RecordingListResponse(APIModel):
+    recordings: List[RecordingSummary]
+
+
 class EventBatch(APIModel):
     events: List[Dict[str, Any]]
 
@@ -525,6 +759,7 @@ class PlanSynthesisResponse(APIModel):
     plan_id: str = Field(..., alias="planId")
     recording_id: str = Field(..., alias="recordingId")
     plan: Plan
+    has_variables: bool = Field(..., alias="hasVariables")
     prompt: str
     raw_response: str = Field(..., alias="rawResponse")
     created_at: datetime = Field(..., alias="createdAt")
@@ -540,6 +775,31 @@ class PlanSaveResponse(APIModel):
     name: str
     updated_at: datetime = Field(..., alias="updatedAt")
     plan: Plan
+    has_variables: bool = Field(default=False, alias="hasVariables")
+
+
+class PlanSummaryItem(APIModel):
+    plan_id: str = Field(..., alias="planId")
+    recording_id: str = Field(..., alias="recordingId")
+    name: str
+    created_at: datetime = Field(..., alias="createdAt")
+    updated_at: datetime = Field(..., alias="updatedAt")
+    has_variables: bool = Field(default=False, alias="hasVariables")
+
+
+class PlanListResponse(APIModel):
+    plans: List[PlanSummaryItem]
+
+
+class PlanDetailResponse(APIModel):
+    plan_id: str = Field(..., alias="planId")
+    recording_id: str = Field(..., alias="recordingId")
+    plan: Plan
+    has_variables: bool = Field(default=False, alias="hasVariables")
+    prompt: Optional[str] = None
+    raw_response: Optional[str] = Field(default=None, alias="rawResponse")
+    created_at: datetime = Field(..., alias="createdAt")
+    updated_at: datetime = Field(..., alias="updatedAt")
 
 
 # -----------------------------------------------------------------------------
@@ -547,9 +807,39 @@ class PlanSaveResponse(APIModel):
 # -----------------------------------------------------------------------------
 
 
+def _coerce_plan_variable(value: Any) -> Optional[VarValue]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return value
+    text = str(value).strip()
+    return text or None
+
+
+def _identify_missing_variables(
+    vars_map: Dict[str, VarValue], placeholders: Set[str]
+) -> List[str]:
+    missing: List[str] = []
+    for name in sorted(placeholders):
+        if name not in vars_map:
+            missing.append(name)
+            continue
+        candidate = vars_map[name]
+        if isinstance(candidate, str):
+            if candidate.strip():
+                continue
+            missing.append(name)
+        elif candidate is None:
+            missing.append(name)
+    return missing
+
+
 class RunStartRequest(APIModel):
     plan_id: str = Field(..., alias="planId")
     start_url: Optional[str] = Field(default=None, alias="startUrl")
+    variables: Optional[Dict[str, VarValue]] = Field(default=None, alias="variables")
 
 
 class RunStartResponse(APIModel):
@@ -567,6 +857,7 @@ class RunState:
     def __init__(self, plan: StoredPlan, *, start_url: Optional[str]) -> None:
         self.run_id = uuid.uuid4().hex
         self.plan = plan
+        self.has_variables = plan.has_variables
         self.start_url = start_url
         self.status = "pending"
         self.created_at = datetime.utcnow()
@@ -576,6 +867,7 @@ class RunState:
         self._latest_frame: Optional[Dict[str, object]] = None
         self._latest_status: Optional[Dict[str, object]] = None
         self._confirmation_future: Optional[asyncio.Future[bool]] = None
+        self._variables_future: Optional[asyncio.Future[Dict[str, VarValue]]] = None
         self.task: Optional[asyncio.Task[None]] = None
 
     async def publish(self, message: Dict[str, object]) -> None:
@@ -625,8 +917,33 @@ class RunState:
             if self._confirmation_future and not self._confirmation_future.done():
                 self._confirmation_future.set_result(bool(allowed))
 
+    async def request_variables(
+        self, payload: Dict[str, object]
+    ) -> Dict[str, VarValue]:
+        future: asyncio.Future[Dict[str, VarValue]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        async with self._lock:
+            if self._variables_future is not None:
+                raise RuntimeError("Variable request already pending")
+            self._variables_future = future
+        await self.publish({"type": "variable_prompt", "payload": payload})
+        try:
+            return await future
+        finally:
+            async with self._lock:
+                self._variables_future = None
+
+    async def resolve_variables(self, values: Dict[str, VarValue]) -> None:
+        async with self._lock:
+            if self._variables_future and not self._variables_future.done():
+                self._variables_future.set_result(values)
+
     async def request_abort(self) -> None:
         self.abort_event.set()
+        async with self._lock:
+            if self._variables_future and not self._variables_future.done():
+                self._variables_future.set_exception(AbortRequested())
         await self.publish({"type": "runner_status", "message": "abort_requested"})
 
 
@@ -685,6 +1002,11 @@ class RunnerDispatcher(RunnerCallbacks):
     async def request_confirmation(self, payload: Dict[str, object]) -> bool:
         return await self._state.request_confirmation(payload)
 
+    async def request_variables(
+        self, payload: Dict[str, object]
+    ) -> Dict[str, VarValue]:
+        return await self._state.request_variables(payload)
+
 
 def get_frontend_path() -> Path:
     if frontend_root.exists():
@@ -700,6 +1022,24 @@ async def serve_frontend() -> FileResponse:
 @app.get("/health")
 async def health() -> JSONResponse:
     return JSONResponse({"ok": True})
+
+
+@app.get("/recordings", response_model=RecordingListResponse)
+async def recordings_list() -> RecordingListResponse:
+    """List all recordings, ordered by most recent first."""
+    recordings = await recording_store.list()
+    summaries = [
+        RecordingSummary(
+            recording_id=rec.recording_id,
+            title=rec.title,
+            status=rec.status,
+            created_at=rec.created_at,
+            updated_at=rec.updated_at,
+            ended_at=rec.ended_at,
+        )
+        for rec in recordings
+    ]
+    return RecordingListResponse(recordings=summaries)
 
 
 @app.post("/recordings/start", response_model=RecordingStartResponse)
@@ -791,9 +1131,17 @@ async def plans_synthesize(request: PlanSynthesisRequest) -> PlanSynthesisRespon
     if recording.bundle is None:
         raise HTTPException(status_code=400, detail="Recording has no frames yet")
 
+    effective_start_url = recording.start_url or request.start_url
+    synthesis_request = request
+    if effective_start_url != request.start_url:
+        try:
+            synthesis_request = request.model_copy(update={"start_url": effective_start_url})
+        except AttributeError:  # pragma: no cover - Pydantic v1 fallback
+            synthesis_request = request.copy(update={"start_url": effective_start_url})  # type: ignore[attr-defined]
+
     try:
         result: PlanSynthesisResult = await plan_synthesizer.synthesize(
-            recording.bundle, request
+            recording.bundle, synthesis_request
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -809,6 +1157,7 @@ async def plans_synthesize(request: PlanSynthesisRequest) -> PlanSynthesisRespon
         plan_id=stored_plan.plan_id,
         recording_id=stored_plan.recording_id,
         plan=stored_plan.plan,
+        has_variables=stored_plan.has_variables,
         prompt=result.prompt,
         raw_response=result.raw_response,
         created_at=stored_plan.created_at,
@@ -820,6 +1169,38 @@ async def _get_plan(plan_id: str) -> StoredPlan:
         return await plan_store.get(plan_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Plan not found") from exc
+
+
+@app.get("/plans", response_model=PlanListResponse)
+async def plans_list(recording_id: Optional[str] = Query(default=None, alias="recordingId")) -> PlanListResponse:
+    summaries = await plan_store.list_summary(recording_id=recording_id)
+    items = [
+        PlanSummaryItem(
+            plan_id=summary.plan_id,
+            recording_id=summary.recording_id,
+            name=summary.name,
+            created_at=summary.created_at,
+            updated_at=summary.updated_at,
+            has_variables=summary.has_variables,
+        )
+        for summary in summaries
+    ]
+    return PlanListResponse(plans=items)
+
+
+@app.get("/plans/{plan_id}", response_model=PlanDetailResponse)
+async def plans_detail(plan_id: str) -> PlanDetailResponse:
+    stored = await _get_plan(plan_id)
+    return PlanDetailResponse(
+        plan_id=stored.plan_id,
+        recording_id=stored.recording_id,
+        plan=stored.plan,
+        has_variables=stored.has_variables,
+        prompt=stored.prompt,
+        raw_response=stored.raw_response,
+        created_at=stored.created_at,
+        updated_at=stored.updated_at,
+    )
 
 
 @app.post("/plans/{plan_id}/save", response_model=PlanSaveResponse)
@@ -834,19 +1215,53 @@ async def plans_save(plan_id: str, request: PlanSaveRequest) -> PlanSaveResponse
         name=stored.plan.name,
         updatedAt=stored.updated_at,
         plan=stored.plan,
+        hasVariables=stored.has_variables,
     )
 
 
 @app.post("/runs/start", response_model=RunStartResponse)
 async def runs_start(request: RunStartRequest) -> RunStartResponse:
     stored_plan = await _get_plan(request.plan_id)
-    state = await run_registry.create(stored_plan, start_url=request.start_url)
+    preferred_start_url = request.start_url or stored_plan.plan.start_url
+    normalized_start_url = (
+        preferred_start_url.strip() if isinstance(preferred_start_url, str) else None
+    )
+    runtime_plan, placeholders = normalize_plan_variables(stored_plan.plan)
+    provided_vars = request.variables or {}
+    sanitized_vars: Dict[str, VarValue] = {}
+    for name, raw in provided_vars.items():
+        if not isinstance(name, str):
+            continue
+        coerced = _coerce_plan_variable(raw)
+        if coerced is None:
+            continue
+        sanitized_vars[name] = coerced
+    if placeholders:
+        merged_vars = dict(runtime_plan.vars)
+        for name in placeholders:
+            merged_vars[name] = sanitized_vars.get(name, "")
+        for name, value in sanitized_vars.items():
+            if name not in placeholders:
+                merged_vars[name] = value
+        missing = _identify_missing_variables(merged_vars, placeholders)
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing values for variables: " + ", ".join(missing),
+            )
+        runtime_plan = copy_plan_with_vars(runtime_plan, merged_vars)
+    elif sanitized_vars:
+        merged_vars = dict(runtime_plan.vars)
+        merged_vars.update(sanitized_vars)
+        runtime_plan = copy_plan_with_vars(runtime_plan, merged_vars)
+
+    state = await run_registry.create(stored_plan, start_url=normalized_start_url)
     dispatcher = RunnerDispatcher(state)
 
     async def _runner_task() -> None:
         try:
             await plan_runner.run(
-                stored_plan.plan,
+                runtime_plan,
                 start_url=state.start_url,
                 callbacks=dispatcher,
             )
@@ -876,6 +1291,7 @@ async def runs_start(request: RunStartRequest) -> RunStartResponse:
             "message": "started",
             "runId": state.run_id,
             "planId": stored_plan.plan_id,
+            "planHasVariables": stored_plan.has_variables,
         }
     )
     return RunStartResponse(run_id=state.run_id)
@@ -906,6 +1322,10 @@ async def _websocket_receiver(websocket: WebSocket, state: RunState) -> None:
             message_type = data.get("type")
             if message_type == "confirm_action":
                 await state.resolve_confirmation(bool(data.get("allow", False)))
+            elif message_type == "submit_variables":
+                values = data.get("values")
+                if isinstance(values, dict):
+                    await state.resolve_variables(values)
             elif message_type == "abort":
                 await state.request_abort()
     except WebSocketDisconnect:

@@ -6,6 +6,7 @@ import {
   appStoreApi,
 } from '../store/appStore';
 import { buildEventEntries, RawEvent } from '../utils/events';
+import { normalizeStartUrl } from '../utils/startUrl';
 
 function buildTeachWsUrl(apiBase: string, teachId: string): string {
   const url = new URL(apiBase);
@@ -13,15 +14,6 @@ function buildTeachWsUrl(apiBase: string, teachId: string): string {
   url.pathname = url.pathname.replace(/\/$/, '') + `/ws/teach/${encodeURIComponent(teachId)}`;
   url.search = '';
   return url.toString();
-}
-
-function normalizeStartUrl(rawUrl: string): string | null {
-  const trimmed = rawUrl.trim();
-  if (!trimmed) return null;
-  if (/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(trimmed)) {
-    return trimmed;
-  }
-  return `http://${trimmed}`;
 }
 
 export function useTeachSession(canvasRef: React.RefObject<HTMLCanvasElement>) {
@@ -78,6 +70,18 @@ export function useTeachSession(canvasRef: React.RefObject<HTMLCanvasElement>) {
         socket.send(JSON.stringify({ type, ...payload }));
       }
     };
+
+    const sendDomProbe = (x: number, y: number, reason: string) => {
+      const socket = teachSocketRef.current;
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'probe_dom', x, y, reason }));
+      }
+    };
+
+    // NOTE: We cannot resolve DOM nodes from a remote screenshot canvas.
+    // The 'probe_dom' message asks the backend (Playwright) to run elementFromPoint
+    // and respond with metadata (tag/id/classes/role/aria/text/selector).
+
     const canvasXYToViewport = (clientX: number, clientY: number) => {
       const { width, height } = appStoreApi.getState().teachViewport;
       const rect = canvas.getBoundingClientRect();
@@ -96,6 +100,8 @@ export function useTeachSession(canvasRef: React.RefObject<HTMLCanvasElement>) {
     const onMouseUp = (event: MouseEvent) => {
       const { x, y } = canvasXYToViewport(event.clientX, event.clientY);
       send('mouse_up', { x, y, button: event.button });
+      // Ask backend to resolve DOM target for better action synthesis
+      sendDomProbe(x, y, 'mouse_up');
       event.preventDefault();
     };
     const onMouseMove = (event: MouseEvent) => {
@@ -243,6 +249,25 @@ export function useTeachSession(canvasRef: React.RefObject<HTMLCanvasElement>) {
           } else if (message.type === 'event_log') {
             const entries = buildEventEntries((message.events || []) as RawEvent[]);
             setEventEntries(entries);
+          } else if (message.type === 'dom_probe' && message.target) {
+            try {
+              const t = message.target as {
+                tag?: string; id?: string; class?: string;
+                role?: string; name?: string; ariaLabel?: string; text?: string;
+                selector?: string; xpath?: string;
+              };
+              const tag = (t.tag || '').toLowerCase();
+              const id = t.id ? `#${t.id}` : '';
+              const cls = t.class ? '.' + String(t.class).trim().split(/\s+/).slice(0, 2).join('.') : '';
+              const role = t.role ? ` [role=${t.role}]` : '';
+              const nameish = t.name || t.ariaLabel || '';
+              const text = t.text ? ` "${String(t.text).trim().slice(0, 60)}"` : '';
+              const sel = t.selector ? ` selector=${t.selector}` : (t.xpath ? ` xpath=${t.xpath}` : '');
+              addConsoleEntry('Target', `${tag}${id}${cls}${role}${text}${nameish ? ' name=' + nameish : ''}${sel ? ' ' + sel : ''}`.trim());
+            } catch (e) {
+              // Fallback: raw dump
+              addConsoleEntry('Target', `DOM target: ${JSON.stringify(message.target)}`);
+            }
           } else if (message.type === 'status') {
             setStatus(message.message || 'Teach update');
           }

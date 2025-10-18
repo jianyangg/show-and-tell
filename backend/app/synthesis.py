@@ -5,8 +5,9 @@ import base64
 import json
 import logging
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Union
 
 from pydantic import BaseModel, Field
 
@@ -15,7 +16,24 @@ try:  # pragma: no cover - compatibility shim for Pydantic v1
 except ImportError:  # pragma: no cover
     ConfigDict = None  # type: ignore
 
+
 logger = logging.getLogger(__name__)
+
+# Optional persistence for visual checkpoints (guarded import)
+try:
+    from .storage import save_visual_checkpoints_for_recording  # type: ignore
+except Exception:  # pragma: no cover
+
+    def save_visual_checkpoints_for_recording(
+        recording_id: str, mapping: Dict[str, List[Dict[str, Any]]]
+    ) -> None:
+        """
+        No-op fallback when storage layer isn't available.
+        Expected mapping schema:
+          { step_id: [ { "png_base64": str, "label": Optional[str] }, ... ] }
+        """
+        return
+
 
 DEFAULT_PLAN_MODEL = "gemini-2.5-pro"
 PLAN_JSON_SCHEMA: Dict[str, Any] = {
@@ -23,6 +41,7 @@ PLAN_JSON_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
     "properties": {
         "name": {"type": "string"},
+        "startUrl": {"type": ["string", "null"], "default": None},
         "vars": {
             "type": "object",
             "default": {},
@@ -43,7 +62,40 @@ PLAN_JSON_SCHEMA: Dict[str, Any] = {
             },
         },
     },
-    "required": ["name", "steps"],
+    "required": ["name", "startUrl", "vars", "steps"],
+}
+
+# OpenAI strict schema for plan synthesis (string-only, stricter requirements)
+OPENAI_PLAN_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "name": {"type": "string"},
+        # OpenAI's strict schema prefers simple types; use empty string when unknown
+        "startUrl": {"type": "string"},
+        # Simplify to a string-only map for broad compatibility
+        "vars": {
+            "type": "object",
+            "additionalProperties": {"type": "string"}
+        },
+        "steps": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "instructions": {"type": "string"}
+                },
+                "required": ["id", "title", "instructions"]
+            }
+        }
+    },
+    # For strict mode, required must include every property key
+    # Note: "vars" is optional since it can be an empty object
+    "required": ["name", "startUrl", "steps"]
 }
 
 VarValue = Union[str, int, float]
@@ -88,12 +140,94 @@ class Plan(_BaseModel):
     name: str
     vars: Dict[str, VarValue] = Field(default_factory=dict)
     steps: List[PlanStep]
+    start_url: Optional[str] = Field(default=None, alias="startUrl")
+    has_variables: bool = Field(default=False, alias="hasVariables")
 
 
 class PlanSynthesisRequest(_BaseModel):
     recording_id: str = Field(..., alias="recordingId")
     plan_name: Optional[str] = Field(default=None, alias="planName")
+    start_url: Optional[str] = Field(default=None, alias="startUrl")
     provider: Optional[str] = None
+    variable_hints: Optional[str] = Field(default=None, alias="variableHints")
+
+_PLACEHOLDER_PATTERN = re.compile(
+    r"""
+    \{\{\s*(?P<double>[^{}\s][^{}]*)\s*\}\}
+    |
+    \{(?P<single>[^{}]+)\}
+    """,
+    re.VERBOSE,
+)
+
+
+def _extract_placeholder(match: re.Match[str]) -> Optional[str]:
+    raw = match.group("double") or match.group("single")
+    if raw is None:
+        return None
+    candidate = raw.strip()
+    return candidate or None
+
+
+def collect_plan_placeholders(plan: Plan) -> Set[str]:
+    placeholders: Set[str] = set()
+
+    def scan(text: Optional[str]) -> None:
+        if not text:
+            return
+        for match in _PLACEHOLDER_PATTERN.finditer(text):
+            key = _extract_placeholder(match)
+            if key:
+                placeholders.add(key)
+
+    scan(plan.name)
+    for step in plan.steps:
+        scan(step.title)
+        scan(step.instructions)
+    return placeholders
+
+
+def _plan_model_copy(plan: Plan, **updates: Any) -> Plan:
+    try:
+        return plan.model_copy(update=updates)  # type: ignore[attr-defined]
+    except AttributeError:  # pragma: no cover - Pydantic v1 fallback
+        return plan.copy(update=updates)  # type: ignore[call-arg]
+
+
+def copy_plan_with_vars(plan: Plan, vars_map: Dict[str, VarValue]) -> Plan:
+    return _plan_model_copy(plan, vars=dict(vars_map))
+
+
+def normalize_plan_variables(plan: Plan) -> tuple[Plan, Set[str]]:
+    placeholders = collect_plan_placeholders(plan)
+    merged_vars = dict(plan.vars)
+    vars_changed = False
+    for name in placeholders:
+        if name not in merged_vars:
+            merged_vars[name] = ""
+            vars_changed = True
+    updates: Dict[str, Any] = {}
+    if vars_changed:
+        updates["vars"] = merged_vars
+    has_variables = bool(placeholders)
+    if plan.has_variables != has_variables:
+        updates["has_variables"] = has_variables
+    if updates:
+        plan = _plan_model_copy(plan, **updates)
+    return plan, placeholders
+
+
+def apply_plan_variables(value: Optional[str], vars_map: Dict[str, VarValue]) -> Optional[str]:
+    if value is None:
+        return None
+
+    def repl(match: re.Match[str]) -> str:
+        key = _extract_placeholder(match)
+        if key and key in vars_map:
+            return str(vars_map[key])
+        return match.group(0)
+
+    return _PLACEHOLDER_PATTERN.sub(repl, value)
 
 
 @dataclass
@@ -101,6 +235,8 @@ class PlanSynthesisResult:
     plan: Plan
     prompt: str
     raw_response: str
+    has_variables: bool = False
+    checkpoints: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
 
 
 class PlanSynthesizer:
@@ -163,7 +299,9 @@ class PlanSynthesizer:
             raise RuntimeError("Plan synthesizer is disabled")
 
         provider = self._resolve_provider(request.provider)
-        prompt = self._build_prompt(recording, request.plan_name)
+        prompt = self._build_prompt(
+            recording, request.plan_name, request.start_url, request.variable_hints
+        )
 
         if provider == "gemini":
             plan_payload, raw_response = await self._synthesize_with_gemini(
@@ -175,7 +313,29 @@ class PlanSynthesizer:
             )
 
         plan = Plan.model_validate(plan_payload)
-        return PlanSynthesisResult(plan=plan, prompt=prompt, raw_response=raw_response)
+        start_url = (request.start_url or "").strip() or None
+        if start_url or plan.start_url:
+            target_start_url = start_url or plan.start_url
+            if target_start_url != plan.start_url:
+                plan = _plan_model_copy(plan, start_url=target_start_url)
+        plan, placeholders = normalize_plan_variables(plan)
+        has_variables = bool(placeholders)
+        # Derive and persist visual checkpoints so the runner can gate completion on them
+        try:
+            cp_map = self._derive_step_checkpoints(recording, plan)
+            self._persist_step_checkpoints(request.recording_id, cp_map)
+        except Exception:
+            logger.exception(
+                "Checkpoint derivation/persistence failed for recording_id=%s",
+                request.recording_id,
+            )
+        return PlanSynthesisResult(
+            plan=plan,
+            prompt=prompt,
+            raw_response=raw_response,
+            has_variables=has_variables,
+            checkpoints=cp_map if "cp_map" in locals() else {},
+        )
 
     def _resolve_provider(self, requested: Optional[str]) -> str:
         provider = (requested or self._default_provider or "gemini").lower()
@@ -277,9 +437,9 @@ class PlanSynthesizer:
             text={
                 "format": {
                     "type": "json_schema",
-                    "name": "plan_schema",  # required
-                    "schema": PLAN_JSON_SCHEMA,  # <-- REQUIRED here (not inside 'json_schema')
-                    "strict": True,  # optional but recommended
+                    "name": "plan_schema",
+                    "schema": OPENAI_PLAN_JSON_SCHEMA,
+                    "strict": True,
                 },
                 "verbosity": "medium",
             },
@@ -294,8 +454,204 @@ class PlanSynthesizer:
         plan_payload, raw_response = self._extract_openai_payload(response)
         return plan_payload, raw_response
 
+    def _format_locator(self, ev: Dict[str, Any]) -> str:
+        """Format a compact, human-readable locator from event payload."""
+        pl = ev.get("primaryLocator")
+        if not pl and isinstance(ev.get("focus"), dict):
+            pl = ev["focus"].get("primaryLocator")
+        if isinstance(pl, dict):
+            if pl.get("by") == "role" and pl.get("role") and pl.get("name"):
+                return f'[role={pl["role"]}] name="{str(pl["name"])[:80]}"'
+            if pl.get("by") == "css" and pl.get("value"):
+                return str(pl["value"])
+        # Fallbacks
+        sel = ev.get("selector")
+        if sel:
+            return str(sel)
+        target = ev.get("actionable") or ev.get("element") or ev.get("focus")
+        if isinstance(target, dict):
+            tag = str(target.get("tag") or "element").lower()
+            nameish = target.get("name") or target.get("label") or ""
+            css = target.get("cssPath") or target.get("selector")
+            text = f' "{str(nameish)[:80]}"' if nameish else ""
+            if css:
+                return f"{tag}{text} {css}"
+            return f"{tag}{text}".strip()
+        return ""
+
+    def _build_interaction_cues(self, events: List[Dict[str, Any]]) -> List[str]:
+        """Turn raw recorded events into timeline cue strings with semantic targets."""
+        cues: List[str] = []
+        for e in events or []:
+            try:
+                ts = float(e.get("ts", 0.0))
+            except Exception:
+                ts = 0.0
+            t = f"{ts:.3f}s"
+            kind = str(e.get("kind") or "")
+            loc = self._format_locator(e)
+            if kind == "click":
+                btn = e.get("button", "left")
+                cues.append(f"{t} click → {btn}{(' on ' + loc) if loc else ''}")
+            elif kind == "dom_probe":
+                cues.append(f"{t} probe → {loc or 'target'}")
+            elif kind == "scroll":
+                dx = int(e.get("deltaX") or 0)
+                dy = int(e.get("deltaY") or 0)
+                cues.append(f"{t} scroll → Δx={dx}, Δy={dy}")
+            elif kind == "key_down":
+                combo = e.get("combo") or e.get("key") or ""
+                focus_loc = self._format_locator(
+                    {"focus": e.get("focus"), "selector": e.get("selector")}
+                )
+                cues.append(
+                    f"{t} key_down → {combo}{(' into ' + focus_loc) if focus_loc else ''}"
+                )
+            elif kind == "key_up":
+                focus_loc = self._format_locator(
+                    {"focus": e.get("focus"), "selector": e.get("selector")}
+                )
+                cues.append(f"{t} key_up{(' on ' + focus_loc) if focus_loc else ''}")
+            else:
+                cues.append(f"{t} {kind}")
+        return cues
+
+    def _candidate_strings(self, ev: Dict[str, Any]) -> List[str]:
+        """Collect locator candidates from an event, deduped and ordered by robustness."""
+        out: List[str] = []
+        seen: set[str] = set()
+
+        def push(s: Optional[str]) -> None:
+            if not s:
+                return
+            if s in seen:
+                return
+            seen.add(s)
+            out.append(s)
+
+        # 1) Primary locator first
+        pl = ev.get("primaryLocator")
+        if not pl and isinstance(ev.get("focus"), dict):
+            pl = ev["focus"].get("primaryLocator")
+        if isinstance(pl, dict):
+            if pl.get("by") == "role" and pl.get("role") and pl.get("name"):
+                push(f'role({pl["role"]},"{str(pl["name"])[:80]}")')
+            if pl.get("by") == "css" and pl.get("value"):
+                push(str(pl["value"]))
+
+        # 2) Other selector candidates
+        for c in ev.get("selectorCandidates") or []:
+            if not isinstance(c, dict):
+                continue
+            if c.get("by") == "css" and c.get("value"):
+                push(str(c["value"]))
+            elif c.get("by") == "role" and c.get("role") and c.get("name"):
+                push(f'role({c["role"]},"{str(c["name"])[:80]}")')
+
+        # 3) Actionable/element fallbacks: id, name, cssPath
+        target = ev.get("actionable") or ev.get("element") or ev.get("focus")
+        if isinstance(target, dict):
+            tid = target.get("id")
+            if tid:
+                push(f"#{tid}")
+            tname = target.get("name") or target.get("label")
+            ttag = (target.get("tag") or "").lower()
+            if ttag in {"input", "select", "textarea"} and tname:
+                push(f'{ttag}[name="{str(tname)[:80]}"]')
+            css = target.get("cssPath") or target.get("selector")
+            if css:
+                push(str(css))
+
+        # 4) Legacy single selector if present
+        if ev.get("selector"):
+            push(str(ev["selector"]))
+
+        return out[:6]
+
+    def _collect_dom_context(
+        self, events: List[Dict[str, Any]], *, limit: int = 16
+    ) -> List[str]:
+        """
+        Return deduped bullets summarizing observed actionable elements with general DOM info.
+        Each line favors role+name, test IDs, then CSS fallbacks.
+        """
+        bullets: List[str] = []
+        seen_keys: set[str] = set()
+
+        def key_for(ev: Dict[str, Any]) -> Optional[str]:
+            pl = ev.get("primaryLocator")
+            if not pl and isinstance(ev.get("focus"), dict):
+                pl = ev["focus"].get("primaryLocator")
+            if (
+                isinstance(pl, dict)
+                and pl.get("by") == "role"
+                and pl.get("role")
+                and pl.get("name")
+            ):
+                return f'role::{pl["role"]}::{str(pl["name"]).strip()}'
+            if isinstance(pl, dict) and pl.get("by") == "css" and pl.get("value"):
+                return f'css::{str(pl["value"])}'
+            sel = ev.get("selector")
+            if sel:
+                return f"css::{str(sel)}"
+            tgt = ev.get("actionable") or ev.get("element")
+            if isinstance(tgt, dict):
+                nameish = tgt.get("name") or tgt.get("label") or ""
+                tag = (tgt.get("tag") or "").lower()
+                cssp = tgt.get("cssPath") or ""
+                return f"{tag}::{nameish}::{cssp}"
+            return None
+
+        for e in events or []:
+            if e.get("kind") not in {"click", "dom_probe", "key_down", "key_up"}:
+                continue
+            k = key_for(e)
+            if not k or k in seen_keys:
+                continue
+            seen_keys.add(k)
+
+            # Human-facing header
+            tgt = e.get("actionable") or e.get("element") or e.get("focus") or {}
+            tag = (
+                (tgt.get("tag") or "element").lower()
+                if isinstance(tgt, dict)
+                else "element"
+            )
+            role = (tgt.get("role") or "").lower() if isinstance(tgt, dict) else ""
+            nameish = ""
+            if isinstance(tgt, dict):
+                nameish = (
+                    tgt.get("name") or tgt.get("label") or tgt.get("ariaLabel") or ""
+                )
+            header = f"{tag}"
+            if role:
+                header += f" [role={role}]"
+            if nameish:
+                header += f' name="{str(nameish)[:80]}"'
+
+            # Candidates list
+            cands = self._candidate_strings(e)
+            if cands:
+                bullets.append(f"- {header} | candidates: " + ", ".join(cands))
+            else:
+                css = (
+                    (tgt.get("cssPath") if isinstance(tgt, dict) else None)
+                    or e.get("selector")
+                    or ""
+                )
+                bullets.append(f"- {header}{(' | css: ' + css) if css else ''}")
+
+            if len(bullets) >= limit:
+                break
+
+        return bullets
+
     def _build_prompt(
-        self, recording: RecordingBundle, plan_name: Optional[str]
+        self,
+        recording: RecordingBundle,
+        plan_name: Optional[str],
+        start_url: Optional[str],
+        variable_hints: Optional[str] = None,
     ) -> str:
         markers = sorted(recording.markers, key=lambda marker: marker.timestamp)
         marker_lines = [
@@ -303,13 +659,17 @@ class PlanSynthesizer:
             for marker in markers
         ]
         timeline_lines = self._summarize_events(recording.events, limit=2_000)
+        normalized_start_url = (start_url or "").strip()
 
         prompt_lines = [
             "You are building an automation plan for Gemini Computer Use.",
+            "Your goal is to create GOAL-ORIENTED, FLEXIBLE instructions that focus on the intended outcome rather than rigid step-by-step actions.",
+            "",
             "Return strict JSON following this schema:",
             json.dumps(
                 {
                     "name": plan_name or "recorded run",
+                    "startUrl": normalized_start_url or "",
                     "vars": {"example": ""},
                     "steps": [
                         {
@@ -321,35 +681,130 @@ class PlanSynthesizer:
                 },
                 ensure_ascii=False,
             ),
+            "",
+            "CRITICAL: The 'name' field is the OVERALL GOAL of this automation.",
+            "- Analyze the recording and infer what the user is trying to accomplish",
+            "- Write a descriptive name that captures the intent (e.g., 'Draw hi on tldraw', 'Search for flights to Paris', 'Create new document')",
+            "- This name will be shown to the user and to the AI agent as the overall goal",
+            "- DO NOT use generic names like 'Captured flow' or 'recorded run'",
+            "- Keep it concise (≤ 60 chars) but meaningful",
+            "",
+            "CRITICAL INSTRUCTION STYLE:",
+            "- Focus on WHAT needs to be achieved, not HOW to click specific elements",
+            "- Write instructions that describe the desired outcome or goal of each step",
+            '- Example: Instead of "Click the pen icon in the third button", write "Select the pen/draw tool from the toolbar"',
+            '- Example: Instead of "Click at coordinates and drag", write "Draw the desired shape or text on the canvas"',
+            "- Let the Computer Use agent figure out the specific UI interactions",
+            "- Instructions should work even if the UI layout changes slightly",
+            "",
+            "NAVIGATION RULES:",
+            "- The startUrl will be loaded AUTOMATICALLY before any steps execute",
+            "- DO NOT include navigation instructions in the first step (e.g., 'Open [site]', 'Navigate to [url]')",
+            "- The user is ALREADY on the startUrl when step 1 begins",
+            "- Start directly with the first meaningful action (e.g., 'Select the pen tool', not 'Open tldraw and select...')",
+            "",
             "Rules:",
-            "- Prefer descriptive step titles.",
-            "- Provide actionable natural language instructions that reference visible UI affordances.",
+            "- Use deterministic step IDs 's1', 's2', ... in chronological order.",
+            "- Align step boundaries to the provided markers (1:1 in order) when markers exist.",
+            "- Keep step IDs stable and human-readable titles short (≤ 80 chars).",
+            "- Infer the USER'S INTENT from the interaction timeline and create instructions that express that intent.",
+            "- If the user draws something, the instruction should be 'Draw [description]', not 'Click and drag'.",
+            "- If the user types text, the instruction should be 'Enter [text] into [field]', not 'Click text box then type'.",
+            "- Provide GOAL-ORIENTED instructions that reference what needs to happen, not rigid click sequences.",
+            '- When referencing UI elements, quote the visible label or role when available (e.g., "press the \'Search\' button", "open the \'Settings\' menu") and avoid low-level selectors.',
+            "- Explicitly call out key presses the user performed (e.g., pressing Enter or shortcuts) so the agent knows to repeat them.",
+            "- Whenever you mention text the user typed that should remain flexible (like names, emails, greetings), replace the literal with a variable placeholder {variableName} and record that variable in vars.",
+            "- Apply the same placeholder rule to the overall plan name and each step title/instruction; never hard-code sample values if a variable exists.",
+            "- Avoid raw x,y coordinates completely unless absolutely necessary for drawing/positioning.",
+            '- Always include the top-level startUrl as a string; use an empty string ("") if unknown.',
             "- When you reference a plan variable use the {var} notation and register it under vars.",
-            "- Prefer 3-6 concise steps that map to the marked timestamps.",
-            "Computer Use toolbelt (reference these capabilities in your instructions when helpful): "
+            '- All entries in vars must be strings (coerce numbers to strings).',
+            "- Prefer concise, outcome-focused steps. Each step should describe a meaningful action or goal.",
+            "- Write instructions that are resilient to minor UI changes.",
+            "",
+            "Computer Use toolbelt (reference these capabilities in your instructions): "
             "navigate(url), open_web_browser(), wait_5_seconds(), go_back(), go_forward(), search(), "
             "click_at(x,y), hover_at(x,y), type_text_at(x,y,text, press_enter=false, clear_before_typing=true), "
             "key_combination(keys), scroll_document(direction), scroll_at(x,y,direction,magnitude), drag_and_drop(x,y,destination_x,destination_y).",
-            'Write instructions as first-person imperatives (e.g., "Click the Investing link in the top navigation").',
+            "",
+            'Write instructions in natural language that express intent (e.g., "Select the pen tool", "Draw \'hi\' on the canvas", "Save the document").',
         ]
+
+        normalized_start_url = (start_url or "").strip()
+        if normalized_start_url:
+            prompt_lines.append(
+                f"Initial start URL (load this page before following the steps): {normalized_start_url}"
+            )
+
+        # Include user's variable hints if provided
+        if variable_hints and variable_hints.strip():
+            prompt_lines.append("")
+            prompt_lines.append("IMPORTANT: User-provided instructions for variable creation:")
+            prompt_lines.append(variable_hints.strip())
+            prompt_lines.append(
+                "Follow these instructions carefully when deciding which values to parameterize. "
+                "Identify the relevant values from the recording and create appropriately named variables."
+            )
+            prompt_lines.append("")
 
         if marker_lines:
             prompt_lines.append("Markers collected during teaching:")
             prompt_lines.extend(marker_lines)
+            prompt_lines.append(
+                "Create one step per marker in the same order when possible."
+            )
 
-        if timeline_lines:
+        timeline_lines = self._summarize_events(
+            recording.events, limit=2_000
+        )  # legacy fallback
+
+        # Prefer enriched cues built from recorded events (role/name/selector), fall back to legacy summary
+        try:
+            interaction_lines = self._build_interaction_cues(recording.events or [])
+        except Exception:
+            interaction_lines = []
+
+        lines_to_use = interaction_lines or timeline_lines
+        if lines_to_use:
+            prompt_lines.append("")
+            prompt_lines.append("Interaction timeline (chronological, already normalized into high-level cues):")
+            prompt_lines.append("")
+            prompt_lines.append("IMPORTANT: Analyze these interactions to INFER THE USER'S GOAL.")
+            prompt_lines.append("Ask yourself:")
+            prompt_lines.append("- What is the user trying to accomplish?")
+            prompt_lines.append("- What tool/feature are they trying to use?")
+            prompt_lines.append("- What content are they creating or modifying?")
+            prompt_lines.append("- What is the end result they want?")
+            prompt_lines.append("")
+            prompt_lines.append("Then write instructions that express that goal, not the mechanical steps.")
+            prompt_lines.append('Example: If you see pen tool selection + drawing strokes, write "Draw [description]" not "Click pen, click canvas, drag".')
+            prompt_lines.append("")
+            prompt_lines.extend(lines_to_use)
+
+        # Add a compact DOM context snapshot so the model can reference robust locators
+        try:
+            dom_bullets = self._collect_dom_context(recording.events or [], limit=16)
+        except Exception:
+            dom_bullets = []
+        if dom_bullets:
             prompt_lines.append(
-                "Interaction timeline (chronological, already normalized into high-level cues):"
+                "Observed UI elements (deduped; prefer these locators in instructions):"
             )
-            prompt_lines.append(
-                'Use these cues to craft precise natural language instructions (e.g., "Scroll down to the market section").'
-            )
-            prompt_lines.extend(timeline_lines)
+            prompt_lines.extend(dom_bullets)
 
         if recording.transcript:
             prompt_lines.append("Transcribed narration (chronological):")
             prompt_lines.append(recording.transcript.strip())
 
+        prompt_lines.append("")
+        prompt_lines.append("FINAL REMINDERS:")
+        prompt_lines.append("1. Set a DESCRIPTIVE 'name' that captures what the user is trying to accomplish.")
+        prompt_lines.append("2. Replace literal typed strings with variable placeholders {varName} everywhere (name, steps, instructions) if they should be provided at runtime.")
+        prompt_lines.append("3. Mention the button/link labels or field names the user interacted with (as seen in the cues).")
+        prompt_lines.append("4. Write GOAL-ORIENTED step instructions that express intent, not mechanical clicks.")
+        prompt_lines.append("5. Use flexible element descriptions, not rigid CSS selectors.")
+        prompt_lines.append("6. DO NOT include 'Open [site]' or 'Navigate to [url]' in steps - the startUrl loads automatically.")
+        prompt_lines.append("")
         prompt_lines.append("Respond with JSON only. Do not add commentary.")
         return "\n".join(prompt_lines)
 
@@ -437,7 +892,10 @@ class PlanSynthesizer:
                     detail_parts.append(selector)
                 if button:
                     detail_parts.append(f"button={button}")
-                lines.append(f"{ts_text} {kind} on " + " ".join(part for part in detail_parts if part))
+                lines.append(
+                    f"{ts_text} {kind} on "
+                    + " ".join(part for part in detail_parts if part)
+                )
                 continue
 
             if kind == "input":
@@ -546,3 +1004,70 @@ class PlanSynthesizer:
             )
 
         return plan_payload, raw_response
+
+    def _derive_step_checkpoints(
+        self, recording: RecordingBundle, plan: Plan
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Heuristic: map steps to the closest recorded frame by timestamp.
+        If markers exist, align steps 1:1 with markers in order.
+        Otherwise, distribute target timestamps evenly across the frame timeline.
+        Returns { step_id: [ { "png_base64": str, "label": str } ] }.
+        """
+        if not recording.frames or not plan.steps:
+            return {}
+
+        # Build arrays of (ts, png)
+        frame_ts = [float(f.timestamp) for f in recording.frames]
+        frame_png = [f.png for f in recording.frames]
+
+        # Target timestamps per step
+        if recording.markers:
+            markers_sorted = sorted(recording.markers, key=lambda m: float(m.timestamp))
+            target_ts = [float(m.timestamp) for m in markers_sorted][: len(plan.steps)]
+        else:
+            # Evenly spread across the observed time range
+            start_ts = frame_ts[0]
+            end_ts = frame_ts[-1]
+            if end_ts <= start_ts:
+                target_ts = [start_ts for _ in plan.steps]
+            else:
+                span = end_ts - start_ts
+                target_ts = [
+                    start_ts + (i * (span / max(1, len(plan.steps) - 1)))
+                    for i in range(len(plan.steps))
+                ]
+
+        # For each target timestamp, choose nearest frame index
+        def nearest_index(ts: float) -> int:
+            # Linear search is fine (frames are already limited for synthesis); keep simple/robust
+            best_i = 0
+            best_d = float("inf")
+            for i, fts in enumerate(frame_ts):
+                d = abs(fts - ts)
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+            return best_i
+
+        mapping: Dict[str, List[Dict[str, Any]]] = {}
+        for i, step in enumerate(plan.steps):
+            idx = nearest_index(target_ts[i] if i < len(target_ts) else frame_ts[-1])
+            # Single primary reference for now; can add neighborhood frames later if needed
+            label = step.title
+            mapping[step.id] = [{"png_base64": frame_png[idx], "label": label}]
+        return mapping
+
+    def _persist_step_checkpoints(
+        self, recording_id: str, mapping: Dict[str, List[Dict[str, Any]]]
+    ) -> None:
+        """
+        Persist to storage if available. Guarded to be non-fatal.
+        """
+        try:
+            if mapping:
+                save_visual_checkpoints_for_recording(recording_id, mapping)
+        except Exception:
+            logger.exception(
+                "Failed to persist visual checkpoints for recording_id=%s", recording_id
+            )
