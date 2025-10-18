@@ -8,7 +8,7 @@ A multi-modal AI automation framework combining trainable computer use, AI debat
 Teach AI by speaking and demonstrating - narrate instructions while performing browser actions, then synthesize your demonstrations into executable automation plans.
 
 - **Teach**: Speak and narrate your intentions while demonstrating browser actions (clicks, typing, navigation)
-- **Capture**: Records your voice instructions, screen actions, and audio transcription in real-time
+- **Capture**: Records your voice instructions, screen actions, and audio transcription in real-time using ElevenLabs
 - **Synthesize**: AI converts your multimodal demonstration into reusable, parameterizable plans using GPT-5
 - **Execute**: Run synthesized plans with Gemini Computer Use for intelligent browser automation
 - **Stream**: Real-time WebSocket updates with live viewport rendering
@@ -18,7 +18,7 @@ Watch two Gemini AI models debate topics with animated avatars and text-to-speec
 
 - Dual Gemini models debating with full context tracking
 - Live2D animated character models (Obama and Trump personas)
-- ElevenLabs text-to-speech integration
+- ElevenLabs text-to-speech integration for realistic voices
 - Real-time WebSocket streaming to browser
 - Dynamic South Park-style background generation
 
