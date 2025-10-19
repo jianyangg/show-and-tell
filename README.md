@@ -117,7 +117,7 @@ RUNNER_VIEWPORT_HEIGHT=900
 
 ## Running the Application
 
-### Quick Start (All Services)
+### Quick Start (All Services) - Not recommended; if this doesnt work, do manual start. These scripts are generated and not verified. 
 
 Use the provided shell script to run all services in parallel:
 
@@ -210,9 +210,9 @@ For reference, here's a complete example:
 {
   "mcpServers": {
     "runner-mcp": {
-      "command": "/Users/jianyang/Documents/Documents - Jian Yang's MacBook Pro/cursor-hackathon/.venv/bin/python3.12",
+      "command": "/Users/jianyang/Documents/Documents - Jian Yang's MacBook Pro/show-and-tell/.venv/bin/python3.12",
       "args": ["-m", "mcp_server"],
-      "cwd": "/Users/jianyang/Documents/Documents - Jian Yang's MacBook Pro/cursor-hackathon",
+      "cwd": "/Users/jianyang/Documents/Documents - Jian Yang's MacBook Pro/show-and-tell",
       "env": {
         "RUNNER_BASE_URL": "http://127.0.0.1:8000",
         "PYTHONPATH": "/Users/jianyang/Documents/Documents - Jian Yang's MacBook Pro/cursor-hackathon"
