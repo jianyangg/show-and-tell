@@ -20,7 +20,7 @@ Watch two Gemini AI models debate topics with animated avatars and text-to-speec
 - Live2D animated character models (Obama and Trump personas)
 - ElevenLabs text-to-speech integration for realistic voices
 - Real-time WebSocket streaming to browser
-- Dynamic South Park-style background generation
+- Dynamic South Park-style background generation using Google Gemini's nano-banana
 
 ### 3. MCP Server Integration
 Model Context Protocol bridge exposing automation capabilities to Claude, Codex, and other AI tools.
