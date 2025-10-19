@@ -773,7 +773,7 @@ class PlanSynthesizer:
 
         prompt_lines = [
             "You are building an automation plan for Gemini Computer Use.",
-            "Your goal is to create GOAL-ORIENTED, FLEXIBLE instructions that focus on the intended outcome rather than rigid step-by-step actions.",
+            "Your goal is to create ATOMIC, SINGLE-ACTION instructions where each step performs exactly ONE discrete action.",
             "",
             "Return strict JSON following this schema:",
             json.dumps(
@@ -799,12 +799,18 @@ class PlanSynthesizer:
             "- DO NOT use generic names like 'Captured flow' or 'recorded run'",
             "- Keep it concise (≤ 60 chars) but meaningful",
             "",
-            "CRITICAL INSTRUCTION STYLE:",
-            "- Focus on WHAT needs to be achieved, not HOW to click specific elements",
-            "- Write instructions that describe the desired outcome or goal of each step",
-            '- Example: Instead of "Click the pen icon in the third button", write "Select the pen/draw tool from the toolbar"',
-            '- Example: Instead of "Click at coordinates and drag", write "Draw the desired shape or text on the canvas"',
-            "- Let the Computer Use agent figure out the specific UI interactions",
+            "CRITICAL INSTRUCTION STYLE - ONE ACTION PER STEP:",
+            "- Each step must contain EXACTLY ONE discrete action (one click, one type, one drag, one scroll, etc.)",
+            "- NEVER combine multiple actions in a single step (e.g., 'Click X and then type Y' is WRONG - split into 2 steps)",
+            "- NEVER write compound instructions like 'Select tool and draw shape' - split into separate steps",
+            "- Each instruction should map to exactly ONE Computer Use action call",
+            '- Good: Step 1: "Click the pen tool button", Step 2: "Draw a line on the canvas"',
+            '- Bad: "Select the pen tool and draw a line" (this is 2 actions, needs 2 steps)',
+            "- Focus on WHAT needs to be achieved in this single action, not HOW to click specific elements",
+            '- Example: "Click the pen tool button in the toolbar" (single click action)',
+            '- Example: "Type the search term into the search box" (single type action)',
+            '- Example: "Draw a horizontal line on the canvas" (single drag action)',
+            "- Let the Computer Use agent figure out the specific UI coordinates",
             "- Instructions should work even if the UI layout changes slightly",
             "",
             "NAVIGATION RULES:",
@@ -815,22 +821,29 @@ class PlanSynthesizer:
             "",
             "Rules:",
             "- Use deterministic step IDs 's1', 's2', ... in chronological order.",
+            "- ATOMIC STEPS: Each step = ONE action only. Never combine multiple actions (click + type, select + drag, etc.).",
+            "- If the user performs multiple interactions, create multiple steps - one per interaction.",
             "- Align step boundaries to the provided markers (1:1 in order) when markers exist.",
             "- Keep step IDs stable and human-readable titles short (≤ 80 chars).",
-            "- Infer the USER'S INTENT from the interaction timeline and create instructions that express that intent.",
-            "- If the user draws something, the instruction should be 'Draw [description]', not 'Click and drag'.",
-            "- If the user types text, the instruction should be 'Enter [text] into [field]', not 'Click text box then type'.",
-            "- Provide GOAL-ORIENTED instructions that reference what needs to happen, not rigid click sequences.",
-            '- When referencing UI elements, quote the visible label or role when available (e.g., "press the \'Search\' button", "open the \'Settings\' menu") and avoid low-level selectors.',
-            "- Explicitly call out key presses the user performed (e.g., pressing Enter or shortcuts) so the agent knows to repeat them.",
+            "- Infer the USER'S INTENT for each individual action from the interaction timeline.",
+            "- Each step instruction should describe ONE concrete action:",
+            "  • ONE click → 'Click the [button/link name]'",
+            "  • ONE drag → 'Draw [shape/line description] on the canvas'",
+            "  • ONE type → 'Type {variable} into the [field name]'",
+            "  • ONE scroll → 'Scroll down the page'",
+            "  • ONE key press → 'Press Enter to submit'",
+            "- WRONG: 'Click the text box and type your name' (2 actions → needs 2 steps)",
+            "- RIGHT: Step 1: 'Click the name input field', Step 2: 'Type {userName} into the field'",
+            '- When referencing UI elements, quote the visible label or role when available (e.g., "Click the \'Search\' button", "Click the \'Settings\' menu") and avoid low-level selectors.',
+            "- Explicitly call out key presses as separate steps (e.g., pressing Enter or shortcuts).",
             "- Whenever you mention text the user typed that should remain flexible (like names, emails, greetings), replace the literal with a variable placeholder {variableName} and record that variable in vars.",
             "- Apply the same placeholder rule to the overall plan name and each step title/instruction; never hard-code sample values if a variable exists.",
             "- Avoid raw x,y coordinates completely unless absolutely necessary for drawing/positioning.",
             '- Always include the top-level startUrl as a string; use an empty string ("") if unknown.',
             "- When you reference a plan variable use the {var} notation and register it under vars.",
             '- All entries in vars must be strings (coerce numbers to strings).',
-            "- Prefer concise, outcome-focused steps. Each step should describe a meaningful action or goal.",
-            "- Write instructions that are resilient to minor UI changes.",
+            "- Each step describes exactly ONE action with a clear, concise outcome.",
+            "- Write instructions that are resilient to minor UI changes but still atomic.",
             "",
             "=== GEMINI COMPUTER USE ACTIONS (CRITICAL) ===",
             "The agent executing this plan has access to the following Computer Use actions.",
@@ -861,23 +874,40 @@ class PlanSynthesizer:
             "TIMING:",
             '  • wait_5_seconds() - Wait for content to load: "Wait for the page to finish loading"',
             "",
-            "INSTRUCTION MAPPING EXAMPLES (how recorded events → step instructions):",
-            '  Recorded: "7.5s drag → left (200,300) → (450,320) distance=250px"',
-            '  Instruction: "Draw a horizontal line on the canvas using the pen tool"',
-            '  → Agent will use: drag_and_drop(x=200, y=300, destination_x=450, destination_y=320)',
+            "INSTRUCTION MAPPING EXAMPLES (ATOMIC: each recorded interaction → ONE step):",
             "",
-            '  Recorded: "3.2s click → left on button[aria-label=\'Submit\']"',
-            '  Instruction: "Click the Submit button to send the form"',
-            '  → Agent will use: click_at(x, y) based on button location',
+            "  Example 1 - Drawing workflow (BAD: compound vs GOOD: atomic):",
+            '  Recorded: "2.1s click → pen tool button"',
+            '            "2.5s drag → (200,300) → (450,320)"',
             "",
-            '  Recorded: "5.1s key_hold → h for 0.06s on input[type=\'text\']"',
-            '           "5.2s key_hold → i for 0.05s on input[type=\'text\']"',
-            '  Instruction: "Type \'{greeting}\' into the text input field"',
-            '  → Agent will use: type_text_at(x, y, text="{greeting}", press_enter=false)',
+            '  ❌ BAD (combines 2 actions): "Select pen tool and draw a line"',
+            '  ✓ GOOD (atomic steps):',
+            '    Step 1: "Click the pen tool button in the toolbar"',
+            '    Step 2: "Draw a horizontal line on the canvas"',
             "",
-            '  Recorded: "2.8s scroll → Δx=0, Δy=450"',
-            '  Instruction: "Scroll down the page to view more content"',
-            '  → Agent will use: scroll_document(direction="down")',
+            "  Example 2 - Form submission (BAD vs GOOD):",
+            '  Recorded: "3.1s click → input field"',
+            '            "3.2s-3.8s key_hold → typing \'hello\'"',
+            '            "4.0s click → submit button"',
+            "",
+            '  ❌ BAD (combines 3 actions): "Enter {greeting} and submit the form"',
+            '  ✓ GOOD (atomic steps):',
+            '    Step 1: "Click the text input field"',
+            '    Step 2: "Type {greeting} into the input field"',
+            '    Step 3: "Click the Submit button"',
+            "",
+            "  Example 3 - Search workflow (BAD vs GOOD):",
+            '  Recorded: "1.5s click → search box"',
+            '            "2.0s-2.5s typing"',
+            '            "2.6s key_down → Enter"',
+            "",
+            '  ❌ BAD (combines 3 actions): "Search for {searchTerm}"',
+            '  ✓ GOOD (atomic steps):',
+            '    Step 1: "Click the search box"',
+            '    Step 2: "Type {searchTerm} into the search box"',
+            '    Step 3: "Press Enter to search"',
+            "",
+            "  REMEMBER: ONE interaction event = ONE step instruction!",
             "",
             "CRITICAL DRAG INSTRUCTION RULES:",
             "- When you see DRAG events in the timeline, analyze the context:",
@@ -938,18 +968,26 @@ class PlanSynthesizer:
             prompt_lines.append("- What content are they creating or modifying?")
             prompt_lines.append("- What is the end result they want?")
             prompt_lines.append("")
-            prompt_lines.append("Then write instructions that express that goal, not the mechanical steps.")
+            prompt_lines.append("Then write ONE ATOMIC step for each distinct interaction you identify.")
             prompt_lines.append("")
-            prompt_lines.append("MAP INTERACTIONS TO COMPUTER USE ACTIONS:")
-            prompt_lines.append('• If you see DRAG events → Use drag_and_drop() action:')
+            prompt_lines.append("MAP EACH INTERACTION TO ONE STEP (ATOMIC MAPPING):")
+            prompt_lines.append('• Each CLICK event → ONE step with click_at() action:')
+            prompt_lines.append('  - "Click the [button/link name]"')
+            prompt_lines.append('  - Example: If user clicks field then button, create 2 separate steps')
+            prompt_lines.append('• Each DRAG event → ONE step with drag_and_drop() action:')
             prompt_lines.append('  - Drawing context: "Draw [description] on the canvas"')
-            prompt_lines.append('  - UI manipulation: "Adjust the [slider/control] by dragging"')
-            prompt_lines.append('• If you see CLICK events → Use click_at() action:')
-            prompt_lines.append('  - "Click the [button/link] to [action]"')
-            prompt_lines.append('• If you see KEY_HOLD events (typing) → Use type_text_at() action:')
+            prompt_lines.append('  - UI manipulation: "Drag the [slider/control] to adjust"')
+            prompt_lines.append('• Each TYPING sequence → ONE step with type_text_at() action:')
             prompt_lines.append('  - "Type \'{variableName}\' into the [field]"')
-            prompt_lines.append('• If you see SCROLL events → Use scroll_document() or scroll_at() action:')
-            prompt_lines.append('  - "Scroll down to view more content"')
+            prompt_lines.append('  - Do NOT combine clicking the field + typing into one step')
+            prompt_lines.append('• Each KEY_PRESS event (Enter, shortcuts) → ONE step with key_combination() action:')
+            prompt_lines.append('  - "Press Enter to submit"')
+            prompt_lines.append('  - "Press Control+A to select all"')
+            prompt_lines.append('• Each SCROLL event → ONE step with scroll action:')
+            prompt_lines.append('  - "Scroll down the page"')
+            prompt_lines.append("")
+            prompt_lines.append("CRITICAL: If you see 5 interactions in the timeline, you should create ~5 steps (one per interaction).")
+            prompt_lines.append("Never merge multiple interactions into a single compound step!")
             prompt_lines.append("")
             prompt_lines.extend(lines_to_use)
 
@@ -981,11 +1019,18 @@ class PlanSynthesizer:
         prompt_lines.append("")
         prompt_lines.append("FINAL REMINDERS:")
         prompt_lines.append("1. Set a DESCRIPTIVE 'name' that captures what the user is trying to accomplish.")
-        prompt_lines.append("2. Replace literal typed strings with variable placeholders {varName} everywhere (name, steps, instructions) if they should be provided at runtime.")
-        prompt_lines.append("3. Mention the button/link labels or field names the user interacted with (as seen in the cues).")
-        prompt_lines.append("4. Write GOAL-ORIENTED step instructions that express intent, not mechanical clicks.")
-        prompt_lines.append("5. Use flexible element descriptions, not rigid CSS selectors.")
-        prompt_lines.append("6. DO NOT include 'Open [site]' or 'Navigate to [url]' in steps - the startUrl loads automatically.")
+        prompt_lines.append("2. Create ATOMIC steps - ONE action per step, NEVER combine multiple actions.")
+        prompt_lines.append("3. Count interactions in the timeline and create approximately the same number of steps.")
+        prompt_lines.append("4. Replace literal typed strings with variable placeholders {varName} everywhere (name, steps, instructions) if they should be provided at runtime.")
+        prompt_lines.append("5. Mention the button/link labels or field names the user interacted with (as seen in the cues).")
+        prompt_lines.append("6. Each step instruction describes ONE concrete action that maps to ONE Computer Use API call.")
+        prompt_lines.append("7. Use flexible element descriptions, not rigid CSS selectors.")
+        prompt_lines.append("8. DO NOT include 'Open [site]' or 'Navigate to [url]' in steps - the startUrl loads automatically.")
+        prompt_lines.append("")
+        prompt_lines.append("ATOMIC STEP CHECKLIST:")
+        prompt_lines.append("- Can this step be split into 2+ actions? → If yes, SPLIT IT")
+        prompt_lines.append('- Does the instruction contain "and", "then", or "after"? → If yes, LIKELY needs splitting')
+        prompt_lines.append("- Would the Computer Use agent need to call 2+ APIs for this step? → If yes, SPLIT IT")
         prompt_lines.append("")
         prompt_lines.append("Respond with JSON only. Do not add commentary.")
         return "\n".join(prompt_lines)

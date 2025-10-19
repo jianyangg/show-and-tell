@@ -405,6 +405,13 @@ pip install -r requirements.txt --force-reinstall
 cd frontend && yarn install --force
 ```
 
+### Editing the prompt
+Sometimes the prompt is too generic and mashes up too many steps into one step.
+The computer use model is only able to handle a step at a time.
+This means the computer use model might skip some steps.
+To fix this, you can edit the prompt used for synthesis in `backend/app/synthesis.py`.
+
+
 ## License
 
 [Your License Here]
